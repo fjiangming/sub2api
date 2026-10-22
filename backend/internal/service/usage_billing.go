@@ -17,10 +17,15 @@ var ErrUsageBillingRequestConflict = errors.New("usage billing request fingerpri
 
 // UsageBillingCommand describes one billable request that must be applied at most once.
 type UsageBillingCommand struct {
-	RequestID          string
-	APIKeyID           int64
-	RequestFingerprint string
-	RequestPayloadHash string
+	// Fork-owned durable handoff; excluded from request fingerprints and serialized commands.
+	RecoveryCaseID         string    `json:"-"`
+	RecoveryUsage          *UsageLog `json:"-"`
+	RecoveryReplay         bool      `json:"-"`
+	RecoveryPricingMissing bool      `json:"-"`
+	RequestID              string
+	APIKeyID               int64
+	RequestFingerprint     string
+	RequestPayloadHash     string
 
 	UserID              int64
 	AccountID           int64

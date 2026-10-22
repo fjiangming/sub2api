@@ -156,6 +156,12 @@ func (p *UsageRecordWorkerPool) Submit(task UsageRecordTask) UsageRecordSubmitMo
 	if p == nil || task == nil {
 		return UsageRecordSubmitModeDropped
 	}
+	// Fork: persist financial work before request completion, rather than retaining it only in memory.
+	if BillingRecoveryEnabled() {
+		p.syncFallback.Add(1)
+		p.execute(task)
+		return UsageRecordSubmitModeSync
+	}
 	if p.pool == nil || p.pool.Stopped() {
 		p.droppedPoolStopped.Add(1)
 		p.logDrop("stopped")
@@ -325,7 +331,11 @@ func (p *UsageRecordWorkerPool) shouldSyncFallback() bool {
 }
 
 func (p *UsageRecordWorkerPool) execute(task UsageRecordTask) {
-	ctx, cancel := context.WithTimeout(context.Background(), p.taskTimeout)
+	timeout := p.taskTimeout
+	if BillingRecoveryEnabled() && timeout < 30*time.Second {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	defer func() {

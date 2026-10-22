@@ -1,0 +1,62 @@
+'use strict';
+
+// Runs the actual fork migration and historical SQL in embedded PostgreSQL.
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const modulePath = process.env.PGLITE_MODULE_PATH || '../../sub2api-extra/operations-center/node_modules/@electric-sql/pglite';
+const { PGlite } = require(modulePath.startsWith('.') ? path.resolve(__dirname, modulePath) : modulePath);
+const root = path.resolve(__dirname, '..');
+const source = fs.readFileSync(path.join(root, 'backend/internal/repository/billing_recovery_settlement.go'), 'utf8');
+const queries = [...source.matchAll(/`([^`]+)`/g)].map((match) => match[1]);
+
+test('historical settlement retains old usage without consuming a later quota window', async () => {
+ const db = new PGlite();
+ try {
+  const migration = fs.readFileSync(path.join(root, 'backend/migrations/custom_20261023_billing_recovery.sql'), 'utf8');
+  await db.exec(migration); await db.exec(migration);
+  await db.exec(`CREATE TABLE user_subscriptions(id bigint PRIMARY KEY, deleted_at timestamptz, updated_at timestamptz,
+   daily_usage_usd numeric DEFAULT 0,weekly_usage_usd numeric DEFAULT 0,monthly_usage_usd numeric DEFAULT 0,
+   daily_window_start timestamptz,weekly_window_start timestamptz,monthly_window_start timestamptz);
+   CREATE TABLE api_keys(id bigint PRIMARY KEY,deleted_at timestamptz,updated_at timestamptz,
+   usage_5h numeric DEFAULT 0,usage_1d numeric DEFAULT 0,usage_7d numeric DEFAULT 0,
+   window_5h_start timestamptz,window_1d_start timestamptz,window_7d_start timestamptz);
+   CREATE TABLE accounts(id bigint PRIMARY KEY,deleted_at timestamptz,updated_at timestamptz,extra jsonb);
+   INSERT INTO user_subscriptions(id,daily_window_start,weekly_window_start,monthly_window_start) VALUES(1,'2026-10-23','2026-10-20','2026-10-01');
+   INSERT INTO api_keys(id,window_5h_start,window_1d_start,window_7d_start) VALUES(1,'2026-10-23','2026-10-23','2026-10-20');
+   INSERT INTO accounts(id,extra) VALUES(1,'{"quota_used":0,"quota_daily_start":"2026-10-23T00:00:00Z","quota_weekly_start":"2026-10-20T00:00:00Z"}');`);
+  for (const prefix of ['UPDATE user_subscriptions SET', 'UPDATE api_keys SET', 'UPDATE accounts SET']) {
+   const sql = queries.find((query) => query.trim().startsWith(prefix)); assert.ok(sql, prefix);
+   await db.query(sql, prefix.includes('user_subscriptions') ? [0.5, 1, false, true, true] : [0.5, 1, '2026-10-22T12:00:00Z']);
+  }
+  const sub = (await db.query('SELECT daily_usage_usd,weekly_usage_usd,monthly_usage_usd FROM user_subscriptions')).rows[0];
+  assert.equal(Number(sub.daily_usage_usd), 0);assert.equal(Number(sub.weekly_usage_usd), 0.5);assert.equal(Number(sub.monthly_usage_usd), 0.5);
+  const key = (await db.query('SELECT usage_5h,usage_1d,usage_7d FROM api_keys')).rows[0];
+  assert.equal(Number(key.usage_5h), 0);assert.equal(Number(key.usage_1d), 0);assert.equal(Number(key.usage_7d), 0.5);
+  const extra = (await db.query('SELECT extra FROM accounts')).rows[0].extra;
+  assert.equal(extra.quota_used, 0.5);assert.equal(extra.quota_daily_used, 0);assert.equal(extra.quota_weekly_used, 0.5);
+ } finally { await db.close(); }
+});
+
+test('missing prices persist usage for review in both dispatch and background preparation', async () => {
+ const db = new PGlite();
+ try {
+  await db.exec(fs.readFileSync(path.join(root, 'backend/migrations/custom_20261023_billing_recovery.sql'), 'utf8'));
+  const repo = fs.readFileSync(path.join(root, 'backend/internal/repository/billing_recovery_repo.go'), 'utf8');
+  const sql = [...repo.matchAll(/`([^`]+)`/g)].map((match) => match[1]);
+  const insert = sql.find((query) => query.includes("ON CONFLICT(api_key_id,native_request_id) DO NOTHING"));
+  const update = sql.find((query) => query.includes('SET native_request_id=$2'));
+  const usage = JSON.stringify({ Model: 'unpriced', InputTokens: 100 });
+  const command = JSON.stringify({ RequestID: 'dispatch:one', RequestFingerprint: 'fingerprint' });
+  await db.query(insert, ['one', 1, 2, null, null, 3, 'unpriced', 'dispatch:one', usage, command, 'review', 'PRICING_UNAVAILABLE']);
+  await db.query(`INSERT INTO sub2api_custom.billing_recovery(id,request_root,user_id,api_key_id,account_id) VALUES('two','root',1,2,3)`);
+  await db.query(update, ['two', 'dispatch:two', usage, command, 'unpriced', 1, 2, 3, null, null, null, 'review', 'PRICING_UNAVAILABLE']);
+  const rows = (await db.query('SELECT state,last_error,usage_record FROM sub2api_custom.billing_recovery ORDER BY id')).rows;
+  assert.equal(rows.length, 2);
+  for (const row of rows) {
+   assert.equal(row.state, 'review'); assert.equal(row.last_error, 'PRICING_UNAVAILABLE');
+   assert.equal(row.usage_record.InputTokens, 100);
+  }
+ } finally { await db.close(); }
+});

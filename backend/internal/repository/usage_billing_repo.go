@@ -16,6 +16,7 @@ type usageBillingRepository struct {
 }
 
 func NewUsageBillingRepository(_ *dbent.Client, sqlDB *sql.DB) service.UsageBillingRepository {
+	service.ConfigureBillingRecovery(&billingRecoveryRepository{db: sqlDB})
 	return &usageBillingRepository{db: sqlDB}
 }
 
@@ -46,13 +47,34 @@ func (r *usageBillingRepository) Apply(ctx context.Context, cmd *service.UsageBi
 	if err != nil {
 		return nil, err
 	}
-	if !applied {
+	if !applied && cmd.RecoveryCaseID == "" {
 		return &service.UsageBillingApplyResult{Applied: false}, nil
 	}
 
-	result := &service.UsageBillingApplyResult{Applied: true}
-	if err := r.applyUsageBillingEffects(ctx, tx, cmd, result); err != nil {
-		return nil, err
+	result := &service.UsageBillingApplyResult{Applied: applied}
+	if cmd.RecoveryCaseID != "" {
+		if err := stageRecoveryUsageInTransaction(ctx, tx, cmd); err != nil {
+			return nil, err
+		}
+	}
+	if applied {
+		if err := r.applyUsageBillingEffects(ctx, tx, cmd, result); err != nil {
+			return nil, err
+		}
+	}
+	if cmd.RecoveryCaseID != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE sub2api_custom.billing_recovery SET state='settled', settled_at=NOW(), updated_at=NOW(), version=version+1,
+          last_error=CASE WHEN last_error IN ('UPSTREAM_BODY_INTERRUPTED','USAGE_OBSERVATION_TRUNCATED') THEN last_error ELSE '' END WHERE id=$1`, cmd.RecoveryCaseID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO sub2api_custom.billing_recovery_events(case_id,action,actor) VALUES ($1,'settled','sub2api')`, cmd.RecoveryCaseID); err != nil {
+			return nil, err
+		}
+		// Native outbox retries auth invalidation even if the process dies after commit.
+		if _, err := tx.ExecContext(ctx, `INSERT INTO auth_cache_invalidation_outbox(cache_key)
+          SELECT encode(sha256(convert_to(key,'UTF8')),'hex') FROM api_keys WHERE id=$1 AND deleted_at IS NULL`, cmd.APIKeyID); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -172,6 +194,9 @@ func (r *usageBillingRepository) applyBatchImageBalanceHold(
 }
 
 func (r *usageBillingRepository) applyUsageBillingEffects(ctx context.Context, tx *sql.Tx, cmd *service.UsageBillingCommand, result *service.UsageBillingApplyResult) error {
+	if cmd.RecoveryReplay {
+		return r.applyHistoricalRecoveryEffects(ctx, tx, cmd, result)
+	}
 	if cmd.SubscriptionCost > 0 && cmd.SubscriptionID != nil {
 		if err := incrementUsageBillingSubscription(ctx, tx, *cmd.SubscriptionID, cmd.SubscriptionCost); err != nil {
 			return err

@@ -1,0 +1,161 @@
+name: Fork Dev Release
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    if: github.repository == 'fjiangming/sub2api' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: version
+        shell: bash
+        run: |
+          IFS=. read -r major minor patch < backend/cmd/server/VERSION
+          patch=${patch%%-*}
+          [[ "$major.$minor.$patch" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          # Three numeric components remain compatible with the built-in updater.
+          version="$major.$minor.$((10#$patch * 1000000 + GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Test backend
+        working-directory: backend
+        run: go test -tags=unit ./internal/service ./internal/repository ./internal/handler ./internal/server/middleware
+      - name: Test billing SQL in PostgreSQL
+        run: |
+          npm install --prefix "$RUNNER_TEMP/billing-sql" --no-audit --no-fund @electric-sql/pglite@0.5.6
+          PGLITE_MODULE_PATH="$RUNNER_TEMP/billing-sql/node_modules/@electric-sql/pglite" node --test .github/billing-recovery-sql.test.cjs
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+      - name: Build update archives
+        env:
+          FORK_VERSION: ${{ needs.version.outputs.version }}
+        shell: bash
+        run: |
+          echo "$FORK_VERSION" > backend/cmd/server/VERSION
+          mkdir -p release-assets
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os=${target%/*}; arch=${target#*/}; binary=sub2api
+            [ "$os" != windows ] || binary=sub2api.exe
+            stage=$(mktemp -d)
+            (cd backend && CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -tags=embed -trimpath \
+              -ldflags "-s -w -X main.Commit=$GITHUB_SHA -X main.Date=$(date -u +%FT%TZ) -X main.BuildType=release" \
+              -o "$stage/$binary" ./cmd/server)
+            archive="sub2api_${FORK_VERSION}_${os}_${arch}"
+            if [ "$os" = windows ]; then
+              (cd "$stage" && zip "$GITHUB_WORKSPACE/release-assets/$archive.zip" "$binary")
+            else
+              tar -czf "release-assets/$archive.tar.gz" -C "$stage" "$binary"
+            fi
+          done
+          (cd release-assets && sha256sum sub2api_* > checksums.txt)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fork-update-assets
+          path: release-assets/
+          retention-days: 7
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: fork-update-assets
+          path: release-assets
+      - name: Prepare container binaries
+        env:
+          FORK_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir -p fork-image/amd64 fork-image/arm64
+          tar -xzf "release-assets/sub2api_${FORK_VERSION}_linux_amd64.tar.gz" -C fork-image/amd64
+          tar -xzf "release-assets/sub2api_${FORK_VERSION}_linux_arm64.tar.gz" -C fork-image/arm64
+          cp -r backend/resources fork-image/resources
+          cp deploy/docker-entrypoint.sh fork-image/docker-entrypoint.sh
+          cp Dockerfile.custom-release fork-image/Dockerfile
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: fork-image
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/fjiangming/sub2api:${{ needs.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/fjiangming/sub2api
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Publish updater-compatible release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORK_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "v$FORK_VERSION" release-assets/* --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "Sub2API $FORK_VERSION" --generate-notes --latest=false
+
+  promote:
+    needs: [version, publish]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fork-promote-latest
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote newest completed release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORK_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # Publication is never cancelled. Promotion is serialized to prevent latest regressing.
+          highest=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name' | sort -V | tail -1)
+          if [ "$highest" = "v$FORK_VERSION" ]; then
+            gh release edit "v$FORK_VERSION" --repo "$GITHUB_REPOSITORY" --latest
+            docker buildx imagetools create --tag ghcr.io/fjiangming/sub2api:latest \
+              ghcr.io/fjiangming/sub2api:$FORK_VERSION
+          fi

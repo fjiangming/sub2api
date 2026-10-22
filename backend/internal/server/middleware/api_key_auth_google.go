@@ -214,6 +214,13 @@ func APIKeyAuthWithSubscriptionGoogle(apiKeyService *service.APIKeyService, subs
 		c.Set(string(ContextKeyUserRole), apiKey.User.Role)
 		setGroupContext(c, apiKey.Group)
 		_ = apiKeyService.TouchLastUsed(c.Request.Context(), apiKey.ID)
+		var guardSubscription *service.UserSubscription
+		if value, ok := c.Get(string(ContextKeySubscription)); ok {
+			guardSubscription, _ = value.(*service.UserSubscription)
+		}
+		guardCtx, guardCancel := service.BillingRecoveryRequest(c.Request.Context(), apiKey, guardSubscription, c.Request.URL.Path, c.Request.Method == "POST")
+		defer guardCancel()
+		c.Request = c.Request.WithContext(guardCtx)
 		c.Next()
 	}
 }

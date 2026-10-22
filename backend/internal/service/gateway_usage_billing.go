@@ -223,6 +223,11 @@ func resolveUsageBillingRequestID(ctx context.Context, upstreamRequestID string)
 		}
 	}
 	if ctx != nil {
+		// A reused client request ID may represent another paid upstream call.
+		// Recovery retries reuse this persisted dispatch identity instead.
+		if id := billingRecoveryAttemptID(ctx); id != "" {
+			return "dispatch:" + id
+		}
 		if clientRequestID, _ := ctx.Value(ctxkey.ClientRequestID).(string); strings.TrimSpace(clientRequestID) != "" {
 			return "client:" + strings.TrimSpace(clientRequestID)
 		}
@@ -372,6 +377,10 @@ func applyUsageBilling(ctx context.Context, requestID string, usageLog *UsageLog
 	billingCtx, cancel := detachedBillingContext(ctx)
 	defer cancel()
 
+	cmd.RecoveryPricingMissing = p.Cost.recoveryPricingMissing
+	if err := prepareBillingRecovery(billingCtx, cmd, usageLog); err != nil {
+		return false, err
+	}
 	result, err := repo.Apply(billingCtx, cmd)
 	if err != nil {
 		return false, err
@@ -389,6 +398,11 @@ func applyUsageBilling(ctx context.Context, requestID string, usageLog *UsageLog
 	}
 
 	finalizePostUsageBilling(billingCtx, p, deps, result)
+	if cmd.RecoveryCaseID != "" {
+		if err := invalidateRecoveryCaches(billingCtx, deps.billingCacheService, usageLog); err == nil {
+			_ = BillingRecovery().CacheComplete(billingCtx, cmd.RecoveryCaseID)
+		}
+	}
 	return true, nil
 }
 
@@ -411,15 +425,15 @@ func finalizePostUsageBilling(ctx context.Context, p *postUsageBillingParams, de
 		return
 	}
 
-	if p.IsSubscriptionBill {
+	if !BillingRecoveryEnabled() && p.IsSubscriptionBill {
 		if p.Cost.ActualCost > 0 && p.User != nil && p.APIKey != nil && p.APIKey.GroupID != nil {
 			deps.billingCacheService.QueueUpdateSubscriptionUsage(p.User.ID, *p.APIKey.GroupID, p.Cost.ActualCost)
 		}
-	} else if p.Cost.ActualCost > 0 && p.User != nil {
+	} else if !BillingRecoveryEnabled() && p.Cost.ActualCost > 0 && p.User != nil {
 		syncBalanceCacheAfterDeduction(ctx, p, deps, result)
 	}
 
-	if p.Cost.ActualCost > 0 && p.APIKey != nil && p.APIKey.HasRateLimits() && deps.billingCacheService != nil {
+	if !BillingRecoveryEnabled() && p.Cost.ActualCost > 0 && p.APIKey != nil && p.APIKey.HasRateLimits() && deps.billingCacheService != nil {
 		deps.billingCacheService.QueueUpdateAPIKeyRateLimitUsage(p.APIKey.ID, p.Cost.ActualCost)
 	}
 
@@ -579,6 +593,9 @@ func detachedBillingContext(ctx context.Context) (context.Context, context.Cance
 }
 
 func detachStreamUpstreamContext(ctx context.Context, stream bool) (context.Context, context.CancelFunc) {
+	if ctx != nil && ctx.Value(billingRequestKey{}) != nil {
+		return ctx, func() {}
+	}
 	if ctx == nil {
 		return context.Background(), func() {}
 	}
@@ -589,6 +606,9 @@ func detachStreamUpstreamContext(ctx context.Context, stream bool) (context.Cont
 }
 
 func detachUpstreamContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx != nil && ctx.Value(billingRequestKey{}) != nil {
+		return ctx, func() {}
+	}
 	if ctx == nil {
 		return context.Background(), func() {}
 	}
@@ -1255,7 +1275,7 @@ func (s *GatewayService) calculateTokenCost(
 	})
 	if err != nil {
 		logger.LegacyPrintf("service.gateway", "Calculate cost failed: %v", err)
-		return &CostBreakdown{ActualCost: 0}
+		return &CostBreakdown{ActualCost: 0, recoveryPricingMissing: BillingRecoveryEnabled()}
 	}
 	return cost
 }

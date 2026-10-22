@@ -272,7 +272,7 @@ func wrapUsageRecordTaskContext(parent context.Context, task service.UsageRecord
 	}
 	return func(ctx context.Context) {
 		defer done()
-		task(usageRecordContext(parent, ctx))
+		task(service.CopyBillingRecoveryContext(parent, usageRecordContext(parent, ctx)))
 	}, done
 }
 
