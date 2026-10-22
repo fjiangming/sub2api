@@ -87,3 +87,7 @@ SQL：安装临时 `@electric-sql/pglite@0.5.6`，`PGLITE_MODULE_PATH` 指定绝
 Windows 全量单测中原作者 `TestOllamaProbeCallback_StaleLongDoesNotOverrideNewShort`、`TestCommandCodeGatewayPassesThroughCatalogProtocols` 出现时间精度边界失败，未改其代码/测试；备份测试需要 Git usr/bin 的 sh 在 PATH。CI 为 Linux，保留测试失败阻断发行。全量 Go 测试没有被标为全部通过。
 本次新增计费回归及现有定价/计费相关测试、2 项 PostgreSQL 历史窗口/缺价核查测试、运营中心 158 项测试及语法检查、前端构建、Linux amd64 嵌入前端二进制构建、桌面/手机交互检查通过；增加 SSE 最后一行无换行符的 usage 采集回归。本地 Docker 守护进程未启动，未进行容器构建、真实上游端到端请求和实际 GitHub 发布；首次 push 须检查 CI。未连接或更新服务器。
 合并上游逐项核查统一计费调用点、HTTP/WS dispatch、usage_logs 列、dedup/归档、限额窗口、缓存 outbox、后台任务、版本解析、归档名和迁移加载器。
+
+## 2026-10-23：首次推送与 CI 适配
+
+首次 GitHub Linux CI 的 lint 发现恢复仓库及测试中 8 个 cleanup 调用未显式处理返回值。`billing_recovery_repo.go`、`billing_recovery_settlement.go`、`billing_recovery_test.go` 改为与原生仓库一致的 deferred cleanup 写法；不改变事务或资金行为。服务器只读核实实际二进制为 0.2.17，冻结镜像仍带 0.1.160 标签；现有 Compose 含 pull_policy: never，首次切换须调整目标服务的镜像及拉取策略。详细命令见相邻 sub2api-extra 的 `operations-center/docs/billing-recovery-update.md`。本轮未更新服务器。

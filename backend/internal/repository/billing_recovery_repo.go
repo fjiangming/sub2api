@@ -140,7 +140,7 @@ func (r *billingRecoveryRepository) List(ctx context.Context, state string, limi
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	result := []service.BillingRecoveryCase{}
 	for rows.Next() {
 		c, err := scanRecovery(rows)
@@ -160,7 +160,7 @@ func (r *billingRecoveryRepository) Review(ctx context.Context, id string, versi
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	result, err := tx.ExecContext(ctx, `UPDATE sub2api_custom.billing_recovery SET state=$3,evidence=$4,
        updated_at=NOW(),next_retry_at=NOW(),attempts=0,version=version+1 WHERE id=$1 AND version=$2 AND state<>'settled'
        AND ($3<>'prepared' OR billing_command IS NOT NULL)
@@ -190,7 +190,7 @@ func (r *billingRecoveryRepository) Restore(ctx context.Context, id string, vers
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	result, err := tx.ExecContext(ctx, `UPDATE sub2api_custom.billing_recovery SET state='review',usage_record=$3,
       billing_command=$4,native_request_id=$5,evidence=$6,updated_at=NOW(),version=version+1
       WHERE id=$1 AND version=$2 AND state IN ('unknown','review')`, id, version, recordJSON, commandJSON, cmd.RequestID, evidence)
@@ -219,7 +219,7 @@ func (r *billingRecoveryRepository) Events(ctx context.Context, id string) ([]ma
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	items := []map[string]any{}
 	for rows.Next() {
 		var a, b, c string

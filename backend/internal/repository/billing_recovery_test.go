@@ -36,7 +36,7 @@ func expectRecoveryStage(mock sqlmock.Sqlmock, cmd *service.UsageBillingCommand,
 func TestBillingRecoveryRecordFailureRollsBackDedupAndMoney(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	cmd := recoveryCommand()
 	mock.ExpectBegin()
 	mock.ExpectQuery("INSERT INTO usage_billing_dedup").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
@@ -50,7 +50,7 @@ func TestBillingRecoveryRecordFailureRollsBackDedupAndMoney(t *testing.T) {
 func TestBillingRecoveryDuplicateCompletesRecordWithoutSecondCharge(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	cmd := recoveryCommand()
 	mock.ExpectBegin()
 	mock.ExpectQuery("INSERT INTO usage_billing_dedup").WillReturnError(sql.ErrNoRows)
@@ -69,7 +69,7 @@ func TestBillingRecoveryDuplicateCompletesRecordWithoutSecondCharge(t *testing.T
 func TestBillingRecoveryMissingPricingIsPersistedForReview(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	cmd := recoveryCommand()
 	cmd.RecoveryPricingMissing = true
 	mock.ExpectQuery("SELECT id,billing_command").WithArgs(cmd.APIKeyID, cmd.RequestID).WillReturnError(sql.ErrNoRows)

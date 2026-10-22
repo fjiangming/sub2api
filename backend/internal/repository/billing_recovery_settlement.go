@@ -24,7 +24,7 @@ func (r *billingRecoveryRepository) Supplement(ctx context.Context, id string, v
 	if err != nil {
 		return "", err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var actual int
 	var state string
 	if err = tx.QueryRowContext(ctx, `SELECT version,state FROM sub2api_custom.billing_recovery WHERE id=$1 FOR UPDATE`, id).Scan(&actual, &state); err != nil {
