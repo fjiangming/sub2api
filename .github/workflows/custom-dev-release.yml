@@ -26,6 +26,22 @@ jobs:
           version="$major.$minor.$((10#$patch * 1000000 + GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  checks:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test release gate
+        run: python3 -m unittest discover -s .github/release-tools -p 'test_fork_release_gate.py'
+      - name: Require CI and security checks for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/release-tools/require_fork_checks.py
+
   build:
     needs: version
     runs-on: ubuntu-latest
@@ -84,7 +100,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: [version, build]
+    needs: [version, checks, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -123,6 +139,19 @@ jobs:
             org.opencontainers.image.source=https://github.com/fjiangming/sub2api
             org.opencontainers.image.version=${{ needs.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
+      - name: Verify container binaries before release
+        env:
+          FORK_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          image="ghcr.io/fjiangming/sub2api:$FORK_VERSION"
+          for platform in linux/amd64 linux/arm64; do
+            docker pull --platform "$platform" "$image"
+            output=$(docker run --rm --platform "$platform" --entrypoint /app/sub2api "$image" -version 2>&1)
+            printf '%s\n' "$output"
+            [[ "$output" == *"Sub2API $FORK_VERSION (commit: $GITHUB_SHA,"* ]]
+          done
+          docker run --rm --platform linux/amd64 --entrypoint /usr/local/bin/pg_dump "$image" --version
+          docker run --rm --platform linux/amd64 --entrypoint /usr/local/bin/psql "$image" --version
       - name: Publish updater-compatible release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

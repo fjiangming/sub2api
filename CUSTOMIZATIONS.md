@@ -93,3 +93,11 @@ Windows 全量单测中原作者 `TestOllamaProbeCallback_StaleLongDoesNotOverri
 首次 GitHub Linux CI 的 lint 发现恢复仓库及测试中 8 个 cleanup 调用未显式处理返回值。`billing_recovery_repo.go`、`billing_recovery_settlement.go`、`billing_recovery_test.go` 改为与原生仓库一致的 deferred cleanup 写法；不改变事务或资金行为。服务器只读核实实际二进制为 0.2.17，冻结镜像仍带 0.1.160 标签；现有 Compose 含 pull_policy: never，首次切换须调整目标服务的镜像及拉取策略。详细命令见相邻 sub2api-extra 的 `operations-center/docs/billing-recovery-update.md`。本轮未更新服务器。
 
 GitHub 安全检查发现原分支锁定的 DOMPurify 3.4.14 命中 GHSA-cg2g-xh64-v4q7、GHSA-mrv2-3pqr-j5jr。`frontend/package.json` 和 `frontend/pnpm-lock.yaml` 将直接及受 override 约束的间接依赖最低版本提升到 3.4.17；保留安全扫描，不添加漏洞豁免。后续合并可采用上游更新的已修复版本。验证：前端 frozen-lockfile 安装、构建及 10 项 URL/Logo 清理回归通过；生产依赖审计按仓库现有豁免规则校验通过。
+
+## 2026-10-23：发行检查门禁与镜像追溯
+
+排查确认早期自定义发行流程与原生 CI / Security Scan 独立，可能在它们失败时仍发布镜像。`.github/workflows/custom-dev-release.yml` 新增 checks job；`.github/release-tools/require_fork_checks.py` 仅接受同一完整 SHA、dev 分支、push 事件下原生两个工作流的最新成功记录。缺失/排队/运行中继续等待，失败/取消/跳过/API 异常/超时阻止 publish 和 latest 提升。保留原生工作流，不侵入原作者 CI，继续为每次合格 push 发布独立版本。
+
+`.github/release-tools/test_fork_release_gate.py` 覆盖提交/分支/事件/工作流隔离、失败/取消/跳过、较新失败不能被旧成功掩盖、重跑未完成、等待双门禁、缺失超时及 API 异常。发布 Release 前运行 amd64/arm64 镜像中的二进制，断言实际版本和完整 commit，并检查 amd64 的 pg_dump/psql 能运行；失败不提升 latest。镜像仍包含 OCI source / revision / version；latest 表示最新成功发行，不能把正在构建或失败的 dev HEAD 当作已发布。服务器只需拉取 GHCR 镜像，步骤及首次冻结镜像切换见 extra 的更新文档；本轮不部署生产。
+
+验证：7 项门禁测试、工作流 YAML / Bash 语法检查通过；真实 GitHub API 对 d3a9911 的完整 CI 与安全检查放行，对 8740f14 的安全失败阻断。额外运行原生 release helpers 全套时，Windows 的 GBK 默认解码及 Bash 路径导致既有测试失败，未修改其源码；同一版本的这些原生测试已在 GitHub Linux CI 通过。
