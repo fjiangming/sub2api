@@ -12,6 +12,8 @@ jobs:
   version:
     if: github.repository == 'fjiangming/sub2api' && github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -25,6 +27,20 @@ jobs:
           # Three numeric components remain compatible with the built-in updater.
           version="$major.$minor.$((10#$patch * 1000000 + GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Reserve immutable source tag before long builds
+        env:
+          FORK_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v$FORK_VERSION"
+          remote_sha=$(git ls-remote --refs origin "refs/tags/$tag" | awk '{print $1}')
+          if [ -n "$remote_sha" ]; then
+            [[ "$remote_sha" = "$GITHUB_SHA" ]]
+          else
+            git tag "$tag" "$GITHUB_SHA"
+            git push origin "refs/tags/$tag:refs/tags/$tag"
+          fi
 
   checks:
     needs: version
@@ -157,8 +173,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FORK_VERSION: ${{ needs.version.outputs.version }}
         run: |
+          [[ "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$FORK_VERSION" --jq '.object.sha')" = "$GITHUB_SHA" ]]
           gh release create "v$FORK_VERSION" release-assets/* --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" --title "Sub2API $FORK_VERSION" --generate-notes --latest=false
+            --verify-tag --title "Sub2API $FORK_VERSION" --generate-notes --latest=false
 
   promote:
     needs: [version, publish]

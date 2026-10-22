@@ -101,3 +101,9 @@ GitHub 安全检查发现原分支锁定的 DOMPurify 3.4.14 命中 GHSA-cg2g-xh
 `.github/release-tools/test_fork_release_gate.py` 覆盖提交/分支/事件/工作流隔离、失败/取消/跳过、较新失败不能被旧成功掩盖、重跑未完成、等待双门禁、缺失超时及 API 异常。发布 Release 前运行 amd64/arm64 镜像中的二进制，断言实际版本和完整 commit，并检查 amd64 的 pg_dump/psql 能运行；失败不提升 latest。镜像仍包含 OCI source / revision / version；latest 表示最新成功发行，不能把正在构建或失败的 dev HEAD 当作已发布。服务器只需拉取 GHCR 镜像，步骤及首次冻结镜像切换见 extra 的更新文档；本轮不部署生产。
 
 验证：7 项门禁测试、工作流 YAML / Bash 语法检查通过；真实 GitHub API 对 d3a9911 的完整 CI 与安全检查放行，对 8740f14 的安全失败阻断。额外运行原生 release helpers 全套时，Windows 的 GBK 默认解码及 Bash 路径导致既有测试失败，未修改其源码；同一版本的这些原生测试已在 GitHub Linux CI 通过。
+
+## 2026-10-23：修复旧提交创建 Release 的 403
+
+发行 run 39864676105 已推送版本镜像，但 `gh release create --target SHA` 返回 HTTP 403 / Resource not accessible by integration；job 实际已有 contents:write。构建期间 dev 已推进且工作流变更，旧 SHA 尚无 tag，符合 GitHub 对无既有引用的历史提交发行所施加的 workflows 权限限制（GitHub 2023-11-02 changelog）。不扩大长期 Token 权限，不用新 HEAD 冒充旧产物来源。
+
+自定义工作流的 version job 在长时间构建前，用该 job 的短期 GITHUB_TOKEN 预先推送完整 SHA 对应的不可变轻量 tag；已有 tag 必须同 SHA，禁止强推。publish 再核对远端 tag 的 SHA，并用 --verify-tag 创建 Release，不再让 Release API 隐式创建历史 tag。失败的检查/构建可能留下 tag，但不会产生正式 Release 或提升 latest；GITHUB_TOKEN 推 tag 不递归触发原生 tag release 流程。YAML、所有 Bash 块及 tag / publish 的依赖关系需持续核验。
