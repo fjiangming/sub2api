@@ -91,3 +91,5 @@ Windows 全量单测中原作者 `TestOllamaProbeCallback_StaleLongDoesNotOverri
 ## 2026-10-23：首次推送与 CI 适配
 
 首次 GitHub Linux CI 的 lint 发现恢复仓库及测试中 8 个 cleanup 调用未显式处理返回值。`billing_recovery_repo.go`、`billing_recovery_settlement.go`、`billing_recovery_test.go` 改为与原生仓库一致的 deferred cleanup 写法；不改变事务或资金行为。服务器只读核实实际二进制为 0.2.17，冻结镜像仍带 0.1.160 标签；现有 Compose 含 pull_policy: never，首次切换须调整目标服务的镜像及拉取策略。详细命令见相邻 sub2api-extra 的 `operations-center/docs/billing-recovery-update.md`。本轮未更新服务器。
+
+GitHub 安全检查发现原分支锁定的 DOMPurify 3.4.14 命中 GHSA-cg2g-xh64-v4q7、GHSA-mrv2-3pqr-j5jr。`frontend/package.json` 和 `frontend/pnpm-lock.yaml` 将直接及受 override 约束的间接依赖最低版本提升到 3.4.17；保留安全扫描，不添加漏洞豁免。后续合并可采用上游更新的已修复版本。验证：前端 frozen-lockfile 安装、构建及 10 项 URL/Logo 清理回归通过；生产依赖审计按仓库现有豁免规则校验通过。
