@@ -201,6 +201,10 @@ func NewHTTPUpstream(cfg *config.Config) service.HTTPUpstream {
 //   - 调用方必须关闭 resp.Body，否则会导致 inFlight 计数泄漏
 //   - inFlight > 0 的客户端不会被淘汰，确保活跃请求不被中断
 func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
+	req, streamProtocol, streamErr := prepareRecoveryStream(req)
+	if streamErr != nil {
+		return nil, streamErr
+	}
 	applyGrokCLIProxyHeaders(req)
 	if err := s.validateRequestHost(req); err != nil {
 		return nil, err
@@ -225,7 +229,8 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 		return nil, recoveryErr
 	}
 	resp, err := doUpstreamRequest(client, req)
-	observeBillingRecoveryResponse(recoveryID, resp, err)
+	observeBillingRecoveryResponse(recoveryID, resp, err, req.Context())
+	aggregateRecoveryStream(resp, streamProtocol)
 	if err != nil {
 		s.recordOpenAIHTTP2Failure(profile, entry.protocolMode, entry.proxyKey, err)
 		// 请求失败，立即减少计数
@@ -257,6 +262,10 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 	// so a configured HTTP or SOCKS proxy is not bypassed.
 	if req != nil && req.URL != nil && strings.EqualFold(req.URL.Scheme, "http") {
 		return s.Do(req, proxyURL, accountID, accountConcurrency)
+	}
+	req, streamProtocol, streamErr := prepareRecoveryStream(req)
+	if streamErr != nil {
+		return nil, streamErr
 	}
 	applyGrokCLIProxyHeaders(req)
 	upstreamProfile := service.HTTPUpstreamProfileDefault
@@ -292,7 +301,8 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 		return nil, recoveryErr
 	}
 	resp, err := doUpstreamRequest(client, req)
-	observeBillingRecoveryResponse(recoveryID, resp, err)
+	observeBillingRecoveryResponse(recoveryID, resp, err, req.Context())
+	aggregateRecoveryStream(resp, streamProtocol)
 	if err != nil {
 		atomic.AddInt64(&entry.inFlight, -1)
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())

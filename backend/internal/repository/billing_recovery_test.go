@@ -115,9 +115,9 @@ func TestBillingRecoveryReadsNullableJSON(t *testing.T) {
 					result, err = repo.Get(context.Background(), "case-1")
 					require.NoError(t, err)
 				} else {
-					mock.ExpectQuery("SELECT count").WithArgs(fixture.filter).
+					mock.ExpectQuery("SELECT count").WithArgs(fixture.filter, 0, 0, 0, false, "").
 						WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-					mock.ExpectQuery("SELECT id,request_root").WithArgs(fixture.filter, 20, 0).WillReturnRows(rows)
+					mock.ExpectQuery("SELECT id,request_root").WithArgs(fixture.filter, 0, 0, 0, false, "", 20, 0).WillReturnRows(rows)
 					items, total, listErr := repo.List(context.Background(), fixture.filter, 20, 0)
 					require.NoError(t, listErr)
 					require.EqualValues(t, 1, total)

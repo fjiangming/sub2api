@@ -63,6 +63,7 @@ API 为 `/api/v1/admin/billing-recovery`；案件字段 snake_case，usage_recor
 ## 配置与发行
 
 - 核心默认开启；`BILLING_RECOVERY_ENABLED=false` 可退回原行为，不推荐关闭。
+- `BILLING_RECOVERY_SYNC_STREAM=true` 默认将支持的同步文本请求在内部转为上游 SSE，再还原同步 JSON；`false` 只关闭桥接，不关闭持久计费。
 - `BILLING_RECOVERY_TIMEOUT_SECONDS` 为 30–7200 秒，默认 1800；到期仍未知进入核查。未知请求超过期限加 60 秒、最近一分钟未更新才能补记。
 - 运营中心 `OPERATIONS_CENTER_BILLING_RECOVERY_ENABLED=true` 默认开启；后台需要已有的持久管理员认证。只有浏览器 SSO 时可人工执行，不用短期浏览器 token 运行后台。
 - dev 每次 push 构建该次 HEAD；本地 commit 不触发 GitHub。fork 需启用 Actions，允许工作流创建 Release/GHCR 包。
@@ -74,7 +75,7 @@ API 为 `/api/v1/admin/billing-recovery`；案件字段 snake_case，usage_recor
 ## 可靠性边界
 
 不静默丢失待计费事项，不等于任何物理故障下立即得到最终账单。断电、SIGKILL、上游不返回最终 usage 时，保留已提交意图/已观察用量，等待查单与核查，不能编造 token 或估算扣费。
-大于 2 MiB 的单 JSON / SSE 行标记截断；图片/音视频继续用原生解析及持久任务。新协议必须验证发出前意图和统一计费入口，不能仅按平台名称推定覆盖。
+数值观察器大于 2 MiB 的单 JSON / SSE 行标记截断；同步桥接的可重读 JSON 请求上限 4 MiB、SSE 聚合上限 64 MiB，越界不能假装收到完整 usage。图片/音视频继续用原生解析及持久任务。新协议必须验证发出前意图和统一计费入口，不能仅按平台名称推定覆盖。
 历史订阅/Key/账号滚动限额只加到原请求所属的现存窗口；旧周期的使用记录保留，不消耗新周期。
 user×platform 的 Redis/flusher 辅助限额沿用原作者体系，没有改成资金账本；恢复资金后如运营依赖该限额展示，还需核对其展示，不能把它当扣费证明。
 数据库不可用时禁止新 dispatch；已发出且尚未持久化最终用量的请求保留原意图。明确的定价失败保留用量并标记 PRICING_UNAVAILABLE 待核查，运营补充历史价格后才能按记录扣费。同步计费增加数据库写入及延迟，上线前需观察真实并发容量。
@@ -121,3 +122,79 @@ GitHub 安全检查发现原分支锁定的 DOMPurify 3.4.14 命中 GHSA-cg2g-xh
 `backend/internal/repository/billing_recovery_repo.go` 仅将 observed_usage 和 request_snapshot 先读到可接受 SQL NULL 的 []byte，再赋给 API 的 JSON 字段，保留 SQL NULL、JSON null 和已有用量的区别。列表、详情和结算恢复读取共用此修复；不改迁移、历史记录、定价、资金事务或上游请求。`backend/internal/repository/billing_recovery_test.go` 新增使用真实 database/sql Scan 转换的 8 个回归子场景，覆盖 unknown、无 HTTP observation 的 prepared / pending、数值用量和 JSON null，分别验证 Get / List、历史快照和已准备的使用记录 / 命令保持原值。
 
 验证：修复前 4 个 SQL NULL 子场景复现与生产完全相同的错误；修复后全部计费恢复回归通过，完整 repository 单元测试通过。Windows 完整测试需将实际 Git 安装目录 E:/Git/usr/bin 加入本次进程 PATH，未改动原作者备份测试。生产只读核对确认 SQL NULL 意图仍保留、已结算事项均对应 usage_logs；发布继续经过 dev 自动工作流的完整 CI / Security 门禁，服务器通过镜像更新，备份仍统一置于 /root/sub2api-deploy/backups/ 的本次专用子目录。
+
+## 2026-10-23：生产等待上游响应超时调整
+
+用户授权后，仅调整服务器 `/root/sub2api-deploy/docker-compose.yml` 中 sub2api 的环境变量：新增 `GATEWAY_RESPONSE_HEADER_TIMEOUT=1800` 和 `BILLING_RECOVERY_TIMEOUT_SECONDS=1800`。前者覆盖原生默认的 600 秒响应头等待上限，后者显式固定 fork 原有的 1800 秒独立处理期限。不能仅提高 Nginx 超时而保留应用的 600 秒上限。后续合并、Compose 替换或镜像更新应保留这两个部署覆盖；它们不修改镜像内的默认值。
+
+`/etc/nginx/conf.d/migrated-services.conf` 中 epoint2api.fjmooo.cn、aihub.fo2.us.ci、aihubdirect.fo2.us.ci 三个域名的 `location /`（均代理到 127.0.0.1:9000），将 `proxy_send_timeout`、`proxy_read_timeout`、`send_timeout` 统一为 1860s。原值分别为 600s、1200s、600s；连接超时、监控路径及其他站点配置保持原值。这些是 Nginx 对应读写间隔的超时，不代表 Cloudflare 或客户端的限制也随之延长。
+
+切换使用原维护开关阻止新请求，并连续 25 秒确认在途和等待队列均为零；备份完整 PostgreSQL 数据库、角色、应用 data 及原配置后，只重建 sub2api，使用 `--no-deps --pull never --force-recreate`。未拉取或部署其他代码，镜像 ID、提交 050d5b96a3ebb1c8cd9e81be2179848f7b3e0449 和运行版本 0.2.17000701 均保持不变。Nginx 校验成功后平滑重载；北京时间 11:10:19 恢复接入。PostgreSQL、Redis、运营中心的容器 ID 和启动时间保持不变。
+
+备份与回滚材料统一存放 `/root/sub2api-deploy/backups/timeout-20261023110218/`，包含私有部署脚本、候选配置、精确差异、原配置、完整 dump、角色、应用 data、SHA-256 清单及核验 JSON。现有 90 天清理任务在启动时删除的 105 条过期使用记录已按切换前的原 ID、原字段恢复；没有再次扣费，原保留策略保持生效。恢复接入前核对用户余额、业务身份、使用记录总数 506670、使用记录费用摘要及迁移记录完全一致。
+
+验证：两份 Compose 的解析结构仅增加上述 2 项环境变量；候选/实际 Nginx 配置均通过 `nginx -t`。主站、运营中心、三个域名的本地回源健康检查成功；从本地电脑访问主站首页/健康接口及运营中心公网健康接口均为 200。VPS 自身经 Cloudflare 访问公网域名返回 403，来源为边缘层，没有变更其规则。生产运营中心使用持久认证读取计费核查各状态列表和 unknown 详情均为 200；恢复后首轮核验的 9 笔已结算真实请求均有原生使用记录和扣费去重记录，已结算缓存待办为 0。未额外发起收费推理、补扣或重发历史推理；未进行超过 10 分钟的受控真实上游端到端验证，不能据此保证上游无最终用量时也能自动扣费。
+
+`docs/server-changes-2026-10-23.md` 追加本次配置、备份、数据保护及验证清单；服务器副本位于本次备份目录的 `SERVER-CHANGES.md`。本轮没有修改核心源代码、推送 GitHub 或发布新镜像，现有其他未提交源码改动未部署。
+
+## 2026-10-23：所有上游的同步超时保护和逐请求核查证据
+
+此节为本地源码修改，未提交、推送、发布或部署；与上一节独立的生产超时配置记录分开。已定位的供应商侧 CDN 约 125 秒 524 会丢失源站最终 usage；单独延长本站期限不能解决该链路。改动不按供应商域名或账号过滤。
+
+| 文件 | 本轮个性化实现与集成约束 |
+| --- | --- |
+| `backend/internal/repository/billing_recovery_stream.go`（新增） | 标准 Anthropic Messages、OpenAI Chat / Responses、Gemini generateContent 同步请求内部使用 SSE，返回原同步 JSON，支持原生工具 / thinking 等输出；复用 apicompat 累加器并保留 Responses 终态扩展字段，长 Token / 工具参数用 Builder 线性累加。不改变签名请求、原生流式、background、媒体或非标准协议；不新增推理重试。4 MiB 请求 / 64 MiB 聚合边界及关闭开关须保留。 |
+| `backend/internal/repository/http_upstream.go` | 普通 HTTP / TLS 两个实际 dispatch 先转换，持久化意图后发送，原始 SSE 先经过观察器，再聚合 JSON；必须保留观察顺序。 |
+| `backend/internal/repository/billing_recovery_transport.go` | 持久化最终 / 部分状态、终止事件、多 choice 完结、响应 Header / body ID、断开及耗时；深度合并嵌套数值 usage。无效计数、初始输出 0、截断、缺少终态不能冒充完整用量；不保存文本或认证数据。 |
+| `backend/internal/service/billing_recovery.go` | 请求归属、关联标识和期限快照；每个真实 dispatch 生成不同关联 ID，保留调用方 Header；AWS 签名不改写。提供列表过滤和原始客户端断开查询，按 Gemini 路径识别原生流式，避免错误记录同步类型。 |
+| `backend/internal/service/billing_recovery_pricing.go`（新增） | 请求入口只捕获模型 / stream / 定价元数据，发出前冻结历史售价、区间、倍率与缓存策略；只读 quote 重建标准 Token 使用记录，不取上游采购成本或今天的售价。媒体 / 工具 / tier / effort / response 模型及缺价拒绝自动报价，转运营核查。 |
+| `backend/internal/server/middleware/api_key_auth.go`、`api_key_auth_google.go` | 在已有恢复上下文中包裹入口请求体，读取完即丢弃正文，仅保留定价元数据。 |
+| `backend/internal/repository/billing_recovery_repo.go` | Begin 原子记录用户邮箱 / 名称、Key / 上游账号 / 分组名称、历史账号倍率及缓存覆盖；列表支持用户 / Key / 上游账号 / 请求 ID / 超时条件，新增 incomplete 查询已结算但最终观察不完整的记录。 |
+| `backend/internal/handler/billing_recovery_handler.go` | 原 admin 边界下增加过滤和版本化只读 `POST /:id/quote`，报价不扣费；补记仍走 review → prepared → native Apply。 |
+| `backend/migrations/custom_20261023_billing_recovery_lookup.sql`（新增） | 仅新增 user / account 查询索引，不改已经执行的恢复迁移，不删除业务数据。 |
+| `backend/internal/repository/billing_recovery_stream_test.go`、`backend/internal/service/billing_recovery_pricing_test.go`（新增）、`backend/internal/repository/billing_recovery_test.go`、`.github/billing-recovery-sql.test.cjs` | 四协议真实 HTTP 断开后收齐 usage、仅一次 dispatch、工具 / thinking / Responses 扩展、2000 片长输出、无效最终计数、历史售价 / 归属、Gemini 原生流式、可空 SQL、新过滤 / 不完整账单 / 新索引的回归。 |
+| `deploy/.env.example` | 说明默认开关、期限和内存边界；Docker 覆盖须显式传入 service environment，单写 .env 不自动注入容器。 |
+| `CUSTOMIZATIONS.md` | 本节登记每项源码 / 配置 / 测试变动，保留前轮独立的生产改动记录。 |
+
+运营编排、持久查单队列、历史 Key 定向日志刷新、证据副本、核查草稿和差额维护位于相邻 extra 工程，不移入核心。运营中心会发现 unknown / review / incomplete；最终标准 Token 和历史价格均完整才生成 review 草稿，不自动批准，不直接扣余额。客户端自带且可重复的 ID（包括上游回显）不授权唯一资金匹配。旧版本没有历史价格快照的意图需人工补全价格凭据。
+
+标准桥接通过上游心跳 / 分片降低供应商 CDN 同步等待超时，但不能要求不配合的上游提供最终账单。未知用量、独立期限耗尽、强制退出、数据库暂不可写时仍保留已提交意图 / 已知数值待核查；不能声称所有物理故障下已准确自动扣费。上游不支持流式或日志时不做估算。发布后需配套更新主站、运营中心及供应商监控三个镜像，原 fork Release / GHCR 更新通道保持不变。
+
+验证：本轮计费相关 Go 回归通过，Windows server 二进制可构建；完整 repository / handler / middleware 单元测试通过，service 全量仍触发原有 `TestOllamaProbeCallback_StaleLongDoesNotOverrideNewShort` 的 Windows 时间精度失败，未修改该测试。真实 PostgreSQL 3 项回归通过。extra 的完整运营中心 172 项与供应商监控 287 项测试、80 个 JS 源文件语法检查、运营中心 check 及桌面 / 390px 手机核查交互通过。CI YAML 依赖与 8 个更新 Bash 块通过解析 / 语法验证。未进行 Docker 构建、GitHub 发行、Linux 执行或真实上游收费请求验证。本地改动尚未应用于服务器。
+
+最终静态检查使用与 GitHub CI 相同的 golangci-lint 2.14.0，在本机对 service / repository / handler / middleware 四个完整包运行得到 `0 issues`。修正了 SSE 测试的未经检查类型断言，改用带错误校验的标准 ResponseController Flush；观察器 finish 用显式 bodyComplete 条件表达同一终态语义，所有不可失败的 Buffer / Builder 写入按仓库 errcheck 规则显式接收返回值。修改后计费回归及最终 server 构建再次通过；两仓库 diff --check 均通过。
+
+## 2026-10-23：授权清理部署临时材料
+
+用户审核清单后授权清理。只删除 `/root/sub2api-deploy/backups/` 下三次专用部署目录内已逐项盘点的 46 个演练/失败/临时条目，约 11.721 GiB；删除前确认没有容器挂载、部署进程或活动锁引用目标。保留正式 dump、角色、应用/运营中心/Redis 备份、files/ 原配置、三份 deploy.py 依赖链及核验材料，约 0.783 GiB。后续 AI 不应再依赖 rehearsal-* 展开副本或 *.first-attempt / *.first-switch-attempt 等已清理材料，应以保留的正式备份及执行回执为准。
+
+清理前后逐文件核对保留备份 SHA-256 和生产配置散列，四个相关服务的容器身份、启动时间及健康状态不变，公网主站/运营中心健康为 200；未修改业务数据或触发重启。回执位于 `/root/sub2api-deploy/backups/timeout-20261023110218/cleanup-20261023.json`。`docs/server-changes-2026-10-23.md` 追加清理结果。本轮仅维护文件和文档，没有修改计费源码或发布镜像。
+
+本地临时文件和生成产物的 48 个待删条目已验证路径范围，但自动安全审核拒绝批量及单文件删除命令，未执行本地删除。Downloads 下清理清单已标明服务器完成/本地未完成，并提供尚未执行的本地 PowerShell 清理脚本；没有删除原始上游 CSV、初次核查证据或未提交的个性化源码。
+
+## 2026-10-23：CSV 历史补记的最小核心接入
+
+此轮根据用户要求仅本地实现，仍在 `fjiangming/sub2api` 的 `dev`；没有提交、推送、发布、部署或操作真实资金。保留此前所有未提交的运输保护、定价快照、查单和文档改动。CSV 解析、时间匹配、价格输入、预览、确认编排及中断恢复继续放在 `sub2api-extra/operations-center`，核心不增加供应商适配器、CSV 解析器、定时任务或另一套扣费实现。
+
+| 文件 | 本轮增量与未来集成要求 |
+| --- | --- |
+| `backend/internal/service/billing_recovery_import.go`（新增） | 独立的导入预留 DTO / 可选 store 接口，限定原生来源、上游账单摘要、预览摘要、用户 / Key / 账号、历史时间和证据；不扩大原通用 store 接口，保留原有测试替身兼容。 |
+| `backend/internal/repository/billing_recovery_import.go`（新增） | 按账号的事务 advisory lock；同账单与同本地来源双重唯一预留，重复同摘要返回原案件。已有案件检查版本 / 归属 / 状态 / 无使用记录 / 静默期。原版错误来源检查原生用户 / Key / 账号 / 分组 / 模型 / 时间及上游尝试序号，排除已有使用记录、持久意图及原生 dedup / 长期归档；缺本地关联 ID、已删除实体或历史订阅不唯一则拒绝。仅创建 review 案件与审计事件，不写 usage_logs 或余额。数组参数必须用 pq.Array。 |
+| `backend/migrations/custom_20261023_billing_recovery_csv_import.sql`（新增） | 新增 `sub2api_custom.billing_import_claims`；`(account_id,bill_identity)` 与 `local_reference` 唯一，绑定 payload_digest、原案件、操作者和时间。文件名在基础 custom 迁移后排序；以后不得改写已经执行的迁移。 |
+| `backend/internal/handler/billing_recovery_handler.go` | 既有管理员边界内新增 `POST /api/v1/admin/billing-recovery/imports/reserve`；列表新增 RFC3339Nano 的 from / to。预留不代表批准或扣费，仍必须按原有 usage → review → settle 接口执行。 |
+| `backend/internal/service/billing_recovery.go`、`backend/internal/repository/billing_recovery_repo.go` | 列表增加历史起止时间过滤，保留原有调用参数与动态分页占位符，不改变普通列表或自动恢复条件。 |
+| `backend/internal/service/billing_recovery_usage.go` | 仅新建、未填写使用记录的 historical-error review 案件豁免新 staging 时间造成的额外一分钟等待；原请求仍须超过独立期限加 60 秒。普通意图的静默期不变。继续复用原生 Restore / Apply 和资金同事务语义。 |
+| `backend/internal/repository/billing_recovery_import_test.go`（新增） | 预留幂等 / 摘要冲突、版本和归属、原生来源 / 订阅、已有账单、删除实体、无资金写入、无效身份、活跃请求及日期分页回归。 |
+| `backend/internal/handler/billing_recovery_handler_test.go`（新增）、`backend/internal/service/billing_recovery_test.go` | HTTP 输入在预留前校验、纳秒日期过滤，以及历史 staging 豁免不能绕过原请求期限。 |
+| `.github/billing-recovery-sql.test.cjs` | 新增真实 PostgreSQL 迁移、历史归属 staging、删除 Key 阻断、原生防重归档及两类唯一约束测试；保留此前 3 项 SQL 回归。 |
+| `CUSTOMIZATIONS.md` | 本节记录本轮全部核心增量；配套操作说明为 extra 的 `operations-center/docs/billing-csv-import.md`。 |
+
+新的人工 CSV 契约：自动生成候选不等于自动批准扣费。没有请求 ID 的上游 CSV 可以按账号 / 模型 / 开始时间匹配本地意图或仍保留的原生错误，但时间归属须确认；多个候选或多行争用同一请求须明确选择并提供依据。CSV 自带的 ID 不可冒充原生日志里缺失的关联证据。已有使用记录不能再按 CSV 收整笔费用，原有差额链约定保持；只剩原版使用记录而没有持久案件的差额不自动建账。上游采购成本不当用户售价；旧请求没有历史快照时由运营人员核定有效售价和原倍率，不能自动套今天的配置。
+
+预留绑定上游账单身份、本地来源和冻结的预览摘要，不允许结算中改用户 / 改价格。原生使用记录、dedup 和资金仍由已有 Apply 事务提交；供应商 CSV、运营中心 SQLite 的丢失或重启不应变成第二次扣费的理由。若原日志、关联证据或最终用量已丢失，保留待核查，不编造归属或 Token。
+
+验证：核心 BillingRecovery 相关 service / repository / handler 回归、4 项真实 PostgreSQL SQL 测试及 Windows server 构建通过；最终 golangci-lint 2.14.0 对上述三个完整包为 0 issues，两仓库 diff --check 通过。运营中心 197 项全量测试（含 25 项 CSV 专项）、实际导出文件 15100 行解析和 1440px / 390px 完整模拟流程通过，详见 extra 台账。未运行 Docker / Linux CI、真实上游推理或生产补扣验证。
+
+## 2026-10-23：授权提交与推送计费修复
+
+用户授权将上述超时观察、同步桥接、历史定价与 CSV 补记改动提交并推送 GitHub。核心沿用 `dev`，配套 extra 沿用 `main`，推送前两仓库均与远端同分支同步。保留自动 CI / Security 门禁及 fork 发行镜像渠道；推送只触发既有 GitHub 构建，不执行服务器更新、生产迁移或真实补扣。服务器须等待用户后续明确通知后再更新。

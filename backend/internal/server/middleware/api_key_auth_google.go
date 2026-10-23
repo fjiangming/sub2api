@@ -220,7 +220,7 @@ func APIKeyAuthWithSubscriptionGoogle(apiKeyService *service.APIKeyService, subs
 		}
 		guardCtx, guardCancel := service.BillingRecoveryRequest(c.Request.Context(), apiKey, guardSubscription, c.Request.URL.Path, c.Request.Method == "POST")
 		defer guardCancel()
-		c.Request = c.Request.WithContext(guardCtx)
+		c.Request = service.CaptureBillingRecoveryIngress(c.Request.WithContext(guardCtx))
 		c.Next()
 	}
 }

@@ -23,7 +23,10 @@ func (s *GatewayService) RestoreBillingRecoveryUsage(ctx context.Context, id str
 	if entry.Version != version || (entry.State != "unknown" && entry.State != "review" && entry.State != "settled") {
 		return "", ErrBillingRecoveryConflict
 	}
-	if time.Since(entry.UpdatedAt) < time.Minute || entry.Command == nil && time.Since(entry.CreatedAt) < BillingRecoveryTimeout()+time.Minute {
+	// Imported legacy failures have already passed their dispatch deadline. Their
+	// fresh staging timestamp must not impose another minute before confirmation.
+	imported := strings.HasPrefix(entry.RequestRoot, "historical-error:") && entry.State == "review" && entry.Usage == nil
+	if (!imported && time.Since(entry.UpdatedAt) < time.Minute) || entry.Command == nil && time.Since(entry.CreatedAt) < BillingRecoveryTimeout()+time.Minute {
 		return "", fmt.Errorf("request may still be running; wait for the recovery deadline before restoring usage")
 	}
 	if key == nil || key.User == nil || key.ID != entry.APIKeyID || key.User.ID != entry.UserID {

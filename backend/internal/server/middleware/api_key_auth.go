@@ -286,7 +286,7 @@ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscripti
 		// Fork: keep receiving usage after disconnect; transport still rejects new dispatches from a cancelled client.
 		guardCtx, guardCancel := service.BillingRecoveryRequest(c.Request.Context(), apiKey, subscription, c.Request.URL.Path, c.Request.Method == http.MethodPost)
 		defer guardCancel()
-		c.Request = c.Request.WithContext(guardCtx)
+		c.Request = service.CaptureBillingRecoveryIngress(c.Request.WithContext(guardCtx))
 		c.Next()
 	}
 }

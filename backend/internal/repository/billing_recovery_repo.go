@@ -18,8 +18,16 @@ func (r *billingRecoveryRepository) Begin(ctx context.Context, c *service.Billin
 	_, err := r.db.ExecContext(ctx, `INSERT INTO sub2api_custom.billing_recovery
       (id,request_root,user_id,api_key_id,group_id,subscription_id,account_id,platform,endpoint,model,request_snapshot)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE($11::jsonb,'{}'::jsonb)||COALESCE((SELECT jsonb_build_object('account_type',type,'account_quota',
-       COALESCE((extra->>'quota_limit')::numeric,0)>0 OR COALESCE((extra->>'quota_daily_limit')::numeric,0)>0 OR COALESCE((extra->>'quota_weekly_limit')::numeric,0)>0)
-       FROM accounts WHERE id=$7),'{}'::jsonb))`, c.ID, c.RequestRoot, c.UserID, c.APIKeyID, c.GroupID, c.SubscriptionID, c.AccountID, c.Platform, c.Endpoint, c.Model, c.Snapshot)
+       COALESCE((extra->>'quota_limit')::numeric,0)>0 OR COALESCE((extra->>'quota_daily_limit')::numeric,0)>0 OR COALESCE((extra->>'quota_weekly_limit')::numeric,0)>0,
+       'account_rate_multiplier',COALESCE(rate_multiplier,1),
+       'account_cache_ttl_override',COALESCE(extra->'cache_ttl_override_enabled','false'::jsonb),
+       'account_cache_ttl_target',extra->>'cache_ttl_override_target')
+       FROM accounts WHERE id=$7),'{}'::jsonb)||jsonb_build_object(
+       'user_email',(SELECT email FROM users WHERE id=$3),
+       'user_name',(SELECT username FROM users WHERE id=$3),
+       'api_key_name',(SELECT name FROM api_keys WHERE id=$4),
+       'account_name',(SELECT name FROM accounts WHERE id=$7),
+       'group_name',(SELECT name FROM groups WHERE id=$5)))`, c.ID, c.RequestRoot, c.UserID, c.APIKeyID, c.GroupID, c.SubscriptionID, c.AccountID, c.Platform, c.Endpoint, c.Model, c.Snapshot)
 	return err
 }
 
@@ -133,12 +141,31 @@ func (r *billingRecoveryRepository) List(ctx context.Context, state string, limi
 		offset = 0
 	}
 	var total int64
-	const filter = `($1='' OR state=$1 OR ($1='pending' AND (state='prepared' OR (state='settled' AND cache_pending)) AND next_retry_at<=NOW()))`
-	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM sub2api_custom.billing_recovery WHERE `+filter, state).Scan(&total); err != nil {
+	f := service.BillingRecoveryFilter(ctx)
+	filter := `($1='' OR state=$1 OR ($1='pending' AND (state='prepared' OR (state='settled' AND cache_pending)) AND next_retry_at<=NOW())
+      OR ($1='incomplete' AND state='settled' AND observed_usage->'_recovery'->>'complete'='false'
+        AND observed_usage->'_recovery'->>'phase' IN ('finished','interrupted')))
+      AND ($2=0 OR user_id=$2) AND ($3=0 OR api_key_id=$3) AND ($4=0 OR account_id=$4)
+      AND (NOT $5 OR http_status IN (408,499,504,524) OR last_error IN ('UPSTREAM_RESULT_UNKNOWN','UPSTREAM_BODY_INTERRUPTED')
+        OR observed_usage->'_recovery'->>'client_disconnected'='true')
+      AND ($6='' OR id=$6 OR request_root=$6 OR upstream_request_id=$6 OR request_snapshot->>'request_id'=$6
+        OR request_snapshot->>'client_request_id'=$6 OR request_snapshot->>'dispatch_correlation_id'=$6
+        OR EXISTS(SELECT 1 FROM jsonb_each_text(COALESCE(observed_usage->'_recovery'->'response_request_ids','{}'::jsonb)) ids WHERE ids.value=$6))`
+	args := []any{state, f.UserID, f.APIKeyID, f.AccountID, f.TimeoutOnly, f.RequestID}
+	if f.From != nil {
+		args = append(args, *f.From)
+		filter += fmt.Sprintf(" AND created_at >= $%d", len(args))
+	}
+	if f.To != nil {
+		args = append(args, *f.To)
+		filter += fmt.Sprintf(" AND created_at < $%d", len(args))
+	}
+	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM sub2api_custom.billing_recovery WHERE `+filter, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT `+recoveryColumns+` FROM sub2api_custom.billing_recovery
-      WHERE `+filter+` ORDER BY CASE WHEN $1='pending' THEN next_retry_at END ASC,created_at DESC,id LIMIT $2 OFFSET $3`, state, limit, offset)
+	query := `SELECT ` + recoveryColumns + ` FROM sub2api_custom.billing_recovery WHERE ` + filter +
+		fmt.Sprintf(" ORDER BY CASE WHEN $1='pending' THEN next_retry_at END ASC,created_at DESC,id LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+	rows, err := r.db.QueryContext(ctx, query, append(args, limit, offset)...)
 	if err != nil {
 		return nil, 0, err
 	}

@@ -183,3 +183,85 @@ Docker 卷：`sub2api-extra_operations-center-data`，容器内目录：`/app/da
 后续服务器更新参考相邻工程的 `operations-center/docs/billing-recovery-update.md`。以两份 Compose 的 fork 镜像地址为准，显式拉取新镜像并仅重建对应应用服务，继续保留原业务数据挂载、数据库和 Redis。
 
 本清单、`server-files-change-audit.json` 和 `server-schema-change-audit.json` 是部署完成后为整理改动清单追加的文件，不会触发应用重启或更改业务配置。
+
+## 8. 2026-10-23 追加：延长上游同步请求等待时间
+
+本节为后续经用户授权的独立配置调整，不改变前文对首次部署的历史记录。北京时间 11:10:19 完成切换并恢复接入，沿用主站版本 `0.2.17000701`、提交 `050d5b96a3ebb1c8cd9e81be2179848f7b3e0449`。
+
+### 8.1 修改的文件
+
+`/root/sub2api-deploy/docker-compose.yml` 仅在 sub2api 服务的 environment 列表新增：
+
+```yaml
+    - GATEWAY_RESPONSE_HEADER_TIMEOUT=1800
+    - BILLING_RECOVERY_TIMEOUT_SECONDS=1800
+```
+
+第一项将应用等待上游响应头的原生默认上限由 600 秒延长到 1800 秒，解决已核实的 11 分钟同步请求在 600 秒处被本机提前中止的问题。第二项把原本默认 1800 秒的计费恢复独立处理期限显式写入部署配置。两项配置在后续仅拉取镜像并重建容器时继续生效。
+
+`/etc/nginx/conf.d/migrated-services.conf` 仅调整以下三个域名中代理到 `http://127.0.0.1:9000` 的 `location /`：
+
+| 域名 | 三项超时的原值 | 三项超时的新值 | 连接超时 |
+| --- | --- | --- | --- |
+| `epoint2api.fjmooo.cn` | 600s | 1860s | 保持 30s |
+| `aihub.fo2.us.ci` | 1200s | 1860s | 保持 60s |
+| `aihubdirect.fo2.us.ci` | 600s | 1860s | 保持 30s |
+
+三项指令为：
+
+```nginx
+proxy_send_timeout 1860s;
+proxy_read_timeout 1860s;
+send_timeout 1860s;
+```
+
+这些指令约束相应的读写间隔；不延长 Cloudflare 或下游客户端自身的超时。主站 `/monitor/` 和其他站点的代理规则、DNS、证书、端口及访问控制均未调整。Nginx 文件尾部分混合换行随写入统一为 LF，无规则变化。
+
+### 8.2 稳定性和数据保护
+
+- 先备份、校验候选 Compose 和 Nginx 配置，再启用现有维护标记阻止新请求进入；保持原容器处理在途请求，连续 25 秒确认在途和等待队列均为零后才进入切换。
+- 排空后完成 PostgreSQL 自定义格式全库备份、角色备份和应用 data 归档，校验备份目录并记录 SHA-256。
+- 仅执行 `docker compose up -d --no-deps --pull never --force-recreate sub2api`；没有拉取镜像、现场构建源码、停止整个 Compose 或重建依赖服务。
+- 主站镜像 ID 保持 `sha256:41b4c7b29537fe4beb9657315f8f4b6e9d0c2a256442741ed25e32039947736e`，挂载保持不变；PostgreSQL、Redis、运营中心的容器 ID、启动时间均保持不变。
+- 主站启动时既有 90 天清理任务删除的 105 条过期使用记录（ID 36170–36274）已按切换前原字段恢复，保留策略未改，没有再次扣费。恢复接入前原有 506670 条使用记录、费用摘要、用户余额摘要、业务身份和迁移记录核对一致。
+- `nginx -t` 成功后执行平滑 reload；主站健康和数据核对通过后删除本次维护标记。没有新增常驻服务、定时任务或生产端口。
+
+### 8.3 新增文件与备份位置
+
+本次所有备份、部署及核验材料统一放在：
+
+```text
+/root/sub2api-deploy/backups/timeout-20261023110218/
+```
+
+| 文件/目录 | 用途 |
+| --- | --- |
+| `files/` | 两份原配置及原 .env、Nginx 主配置/维护规则、应用配置/价格、运营中心部署配置的私有备份 |
+| `docker-compose.candidate.yml`、`migrated-services.candidate.conf`、`nginx-validation.conf` | 经过校验的候选配置及独立校验入口 |
+| `docker-compose.yml.diff`、`migrated-services.conf.diff`、`plan.json`、`original-files.json` | 配置差异、允许变更、原文件散列及权限 |
+| `sub2api-before-update.dump`、`postgres-roles-before-update.sql`、`sub2api-data.tgz`、`backup-manifest.json`、`database-backup-contents.txt` | 完整数据库/角色/应用文件备份及校验依据 |
+| `retention-candidates.copy`、`retention-candidates.json`、`expired-history-restored.json` | 过期历史记录的原始导出和原样恢复记录 |
+| `before.json`、`business-before.json`、`business-after.json`、`schema-before.json`、`verification.json` | 容器、业务数据、迁移及切换后配置核验 |
+| `live-verification.json`、`authenticated-api-verification.json`、`nginx-verification.json`、`external-verification.json` | 健康、真实结算、认证 API、实际 Nginx 和公网探测结果 |
+| `deploy.py`、`events.jsonl`、`status.json`、`switch.log`、`commands.log`、`switch.pid`、`execution.lock`、`switch-started.json`、备份日志及 `__pycache__/` | 本次专用部署/失败回滚脚本、过程和状态材料；不是常驻任务 |
+| `SERVER-CHANGES.md` | 本清单的服务器副本 |
+
+备份目录权限为 0700，备份配置和日志受 root 权限保护；其中包含私有环境配置和业务数据，不应公开上传。临时 `/etc/nginx/aihub-maintenance.flag` 已删除，两个目标配置文件的原权限和属主保持不变。
+
+### 8.4 验证和边界
+
+两份 Compose 的完整解析结果仅增加 2 个环境变量；实际容器中两项均为 1800。实际 Nginx 三个域名的 9 条目标指令均为 1860s，候选与生效配置语法检查通过。主站及运营中心健康检查、三个域名的本机回源检查均为 200。
+
+从本地电脑访问公网主站首页、主站健康接口、运营中心健康接口均为 200。VPS 自身通过 Cloudflare 访问这几个公网地址返回边缘层 403，未修改 Cloudflare 规则；该探测来源与本地电脑及实际接入流量的结果不同。
+
+运营中心的持久管理员认证正常：unknown、prepared、settled、review、pending 和全部状态列表，以及 unknown 详情读取均为 200。恢复接入后的首轮核验中，9 笔已结算真实请求全部对应原生使用记录及扣费去重记录，已结算缓存待办为 0；未额外发起收费推理或补扣来做测试。
+
+本次修复的是已确认的应用 600 秒等待上限和三处代理的较短等待时间，没有部署本地其他未提交的源码改动，也没有发布新镜像。没有执行受控的超过 10 分钟真实上游推理，因此不能把健康和短请求验收等同于所有长请求场景已验证。上游始终不返回最终用量、超过独立处理期限或连接被上游终止时，仍需保留核查事项并凭证据处理；历史遗漏记录不会由这次配置变更自动补扣。
+
+## 9. 2026-10-23 追加：清理部署演练与失败材料
+
+用户审核文件清理清单后授权删除。复核所有容器挂载和部署进程后，仅删除三个专用备份目录内清单明确列出的 46 个条目，释放约 11.721 GiB；主要为三套独立 rehearsal-postgres 副本、演练应用/运营中心副本、演练 dump、失败切换副本、旧脚本草稿和历史 PID/缓存。上述第 2、8 节列出的相关演练/临时材料是清理前的历史记录，现不再全部存在。
+
+三个备份父目录和正式备份、files/ 原配置、deploy.py 依赖链、核验报告仍保留，合计约 0.783 GiB。清理前后保留条目逐文件 SHA-256 及生产配置散列核对一致；主站、PostgreSQL、Redis、运营中心的容器 ID、镜像、启动时间、重启次数及健康状态保持一致，未重启任何服务或修改业务数据。主站和运营中心本机及公网健康接口均为 200。
+
+逐项执行回执保存在 `/root/sub2api-deploy/backups/timeout-20261023110218/cleanup-20261023.json`，包含删除路径、占用、保留文件散列及前后服务状态。没有清理 Docker 镜像、生产数据卷、运行日志或其他既有备份目录。

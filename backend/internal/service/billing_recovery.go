@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/google/uuid"
 )
 
@@ -81,6 +82,39 @@ func BillingRecovery() BillingRecoveryStore {
 func BillingRecoveryEnabled() bool { return BillingRecovery() != nil }
 
 type billingRequestKey struct{}
+type billingRecoveryStreamKey struct{}
+type billingRecoveryFilterKey struct{}
+
+type BillingRecoveryListFilter struct {
+	UserID, APIKeyID, AccountID int64
+	TimeoutOnly                 bool
+	RequestID                   string
+	From, To                    *time.Time
+}
+
+func WithBillingRecoveryFilter(ctx context.Context, filter BillingRecoveryListFilter) context.Context {
+	return context.WithValue(ctx, billingRecoveryFilterKey{}, filter)
+}
+
+func BillingRecoveryFilter(ctx context.Context) BillingRecoveryListFilter {
+	filter, _ := ctx.Value(billingRecoveryFilterKey{}).(BillingRecoveryListFilter)
+	return filter
+}
+
+func HasBillingRecoveryRequest(ctx context.Context) bool {
+	_, ok := ctx.Value(billingRequestKey{}).(*billingRequestState)
+	return ok
+}
+
+func BillingRecoveryClientDisconnected(ctx context.Context) bool {
+	state, _ := ctx.Value(billingRequestKey{}).(*billingRequestState)
+	return state != nil && state.Original.Err() != nil
+}
+
+func WithBillingRecoveryStream(ctx context.Context, protocol string) context.Context {
+	return context.WithValue(ctx, billingRecoveryStreamKey{}, protocol)
+}
+
 type billingRequestState struct {
 	Original                context.Context
 	Root                    string
@@ -89,6 +123,9 @@ type billingRequestState struct {
 	Platform, Endpoint      string
 	Snapshot                json.RawMessage
 	LastAttempt             atomic.Pointer[string]
+	Ingress                 atomic.Pointer[recoveryIngress]
+	Key                     *APIKey
+	StartedAt               time.Time
 }
 
 func BillingRecoveryTimeout() time.Duration {
@@ -105,8 +142,10 @@ func BillingRecoveryRequest(ctx context.Context, key *APIKey, subscription *User
 		return ctx, func() {}
 	}
 	state := &billingRequestState{Original: ctx, Root: uuid.NewString(), UserID: key.User.ID, KeyID: key.ID,
-		GroupID: key.GroupID, Platform: PlatformFromAPIKey(key), Endpoint: endpoint}
-	state.Snapshot, _ = json.Marshal(map[string]any{"key_quota": key.Quota > 0, "key_rate_limits": key.HasRateLimits()})
+		GroupID: key.GroupID, Platform: PlatformFromAPIKey(key), Endpoint: endpoint, Key: key, StartedAt: time.Now()}
+	state.Snapshot, _ = json.Marshal(map[string]any{"key_quota": key.Quota > 0, "key_rate_limits": key.HasRateLimits(),
+		"request_id": ctx.Value(ctxkey.RequestID), "client_request_id": ctx.Value(ctxkey.ClientRequestID),
+		"recovery_timeout_seconds": int(BillingRecoveryTimeout().Seconds())})
 	if subscription != nil {
 		state.SubscriptionID = &subscription.ID
 	}
@@ -144,24 +183,83 @@ func BeginBillingRecoveryAttempt(req *http.Request, accountID int64) (string, er
 		return "", err
 	}
 	id := uuid.NewString()
+	if req.URL != nil && !strings.HasPrefix(recoveryRequestHeader(req.Header, "authorization"), "AWS4-") {
+		req.Header = req.Header.Clone()
+		if req.Header == nil {
+			req.Header = make(http.Header)
+		}
+		for _, name := range []string{"X-Request-ID", "X-Client-Request-ID"} {
+			value := recoveryRequestHeader(req.Header, name)
+			last := state.LastAttempt.Load()
+			if value == "" || last != nil && value == *last {
+				for key := range req.Header {
+					if strings.EqualFold(key, name) {
+						delete(req.Header, key)
+					}
+				}
+				req.Header.Set(name, id)
+			}
+		}
+	}
 	model := ""
+	stream := false
 	if req.GetBody != nil {
 		if body, err := req.GetBody(); err == nil {
 			var fields struct {
-				Model string `json:"model"`
+				Model  string `json:"model"`
+				Stream bool   `json:"stream"`
 			}
 			// The decoder only retains model; no prompt or credentials enter the journal.
 			_ = json.NewDecoder(http.MaxBytesReader(nil, body, 4<<20)).Decode(&fields)
 			_ = body.Close()
 			model = fields.Model
+			stream = fields.Stream
 		}
+	}
+	if model == "" && req.URL != nil {
+		if index := strings.LastIndex(req.URL.Path, "/models/"); index >= 0 {
+			model = strings.SplitN(req.URL.Path[index+len("/models/"):], ":", 2)[0]
+		}
+	}
+	if req.URL != nil && strings.HasSuffix(req.URL.Path, ":streamGenerateContent") {
+		stream = true
 	}
 	ctx, cancel := detachedBillingContext(req.Context())
 	defer cancel()
 	entry := &BillingRecoveryCase{ID: id, RequestRoot: state.Root, UserID: state.UserID, APIKeyID: state.KeyID,
 		GroupID: state.GroupID, SubscriptionID: state.SubscriptionID, AccountID: accountID,
 		Platform: state.Platform, Endpoint: state.Endpoint, Model: model}
-	entry.Snapshot = state.Snapshot
+	var snapshot map[string]any
+	_ = json.Unmarshal(state.Snapshot, &snapshot)
+	if snapshot == nil {
+		snapshot = map[string]any{}
+	}
+	snapshot["upstream_stream"] = stream
+	if req.URL != nil {
+		snapshot["upstream_path"] = req.URL.Path
+	}
+	snapshot["downstream_stream"] = stream
+	if ingress := state.Ingress.Load(); ingress != nil {
+		snapshot["downstream_stream"] = ingress.Stream || strings.HasSuffix(state.Endpoint, ":streamGenerateContent")
+	}
+	if protocol, _ := req.Context().Value(billingRecoveryStreamKey{}).(string); protocol != "" {
+		snapshot["sync_stream_protocol"] = protocol
+		snapshot["downstream_stream"] = false
+		snapshot["upstream_stream"] = true
+	}
+	// Restrict correlation metadata to bounded identifiers; never persist auth headers.
+	ids := map[string]string{}
+	for _, name := range []string{"x-request-id", "x-client-request-id", "request-id"} {
+		if value := strings.TrimSpace(recoveryRequestHeader(req.Header, name)); value != "" && len(value) <= 128 && !strings.ContainsAny(value, "\r\n") {
+			ids[name] = value
+		}
+	}
+	snapshot["sent_request_ids"] = ids
+	snapshot["dispatch_correlation_id"] = id
+	if pricing := snapshotRecoveryPrice(ctx, state, model, req); pricing != nil {
+		snapshot["pricing"] = pricing
+	}
+	entry.Snapshot, _ = json.Marshal(snapshot)
 	if err := store.Begin(ctx, entry); err != nil {
 		return "", fmt.Errorf("billing recovery persistence unavailable: %w", err)
 	}
@@ -170,6 +268,15 @@ func BeginBillingRecoveryAttempt(req *http.Request, accountID int64) (string, er
 		return "", err
 	}
 	return id, nil
+}
+
+func recoveryRequestHeader(header http.Header, name string) string {
+	for key, values := range header {
+		if strings.EqualFold(key, name) && len(values) > 0 {
+			return values[0]
+		}
+	}
+	return ""
 }
 
 func billingRecoveryAttemptID(ctx context.Context) string {

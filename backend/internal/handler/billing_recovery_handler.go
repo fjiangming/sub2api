@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
@@ -13,6 +14,7 @@ import (
 
 // Registered inside the existing admin authentication, rate-limit and audit boundary.
 func RegisterBillingRecoveryRoutes(admin *gin.RouterGroup, h *GatewayHandler) {
+	service.ConfigureBillingRecoveryPricing(h.gatewayService)
 	group := admin.Group("/billing-recovery")
 	store := func(c *gin.Context) service.BillingRecoveryStore {
 		s := service.BillingRecovery()
@@ -34,13 +36,60 @@ func RegisterBillingRecoveryRoutes(admin *gin.RouterGroup, h *GatewayHandler) {
 		}
 		response.ErrorFrom(c, err)
 	}
+	group.POST("/imports/reserve", func(c *gin.Context) {
+		s := store(c)
+		if s == nil {
+			return
+		}
+		imports, ok := s.(service.BillingRecoveryImportStore)
+		if !ok {
+			response.Error(c, http.StatusServiceUnavailable, "Historical billing import is unavailable")
+			return
+		}
+		var input service.BillingRecoveryImport
+		if err := c.ShouldBindJSON(&input); err != nil {
+			response.BadRequest(c, "A verified local source, bill identity and preview are required")
+			return
+		}
+		id, err := imports.ReserveImport(c.Request.Context(), &input, actor(c))
+		if err != nil {
+			respondError(c, err)
+			return
+		}
+		response.Success(c, gin.H{"case_id": id})
+	})
 	group.GET("", func(c *gin.Context) {
 		s := store(c)
 		if s == nil {
 			return
 		}
 		page, size := response.ParsePagination(c)
-		items, total, err := s.List(c.Request.Context(), c.Query("state"), size, (page-1)*size)
+		filter := service.BillingRecoveryListFilter{TimeoutOnly: c.Query("timeout_only") == "true", RequestID: c.Query("request_id")}
+		for name, target := range map[string]**time.Time{"from": &filter.From, "to": &filter.To} {
+			if value := c.Query(name); value != "" {
+				at, err := time.Parse(time.RFC3339Nano, value)
+				if err != nil {
+					response.BadRequest(c, "Invalid "+name)
+					return
+				}
+				*target = &at
+			}
+		}
+		for name, target := range map[string]*int64{"user_id": &filter.UserID, "api_key_id": &filter.APIKeyID, "account_id": &filter.AccountID} {
+			if value := c.Query(name); value != "" {
+				id, err := strconv.ParseInt(value, 10, 64)
+				if err != nil || id <= 0 {
+					response.BadRequest(c, "Invalid "+name)
+					return
+				}
+				*target = id
+			}
+		}
+		if len(filter.RequestID) > 128 {
+			response.BadRequest(c, "Request ID is too long")
+			return
+		}
+		items, total, err := s.List(service.WithBillingRecoveryFilter(c.Request.Context(), filter), c.Query("state"), size, (page-1)*size)
 		if err != nil {
 			respondError(c, err)
 			return
@@ -113,6 +162,25 @@ func RegisterBillingRecoveryRoutes(admin *gin.RouterGroup, h *GatewayHandler) {
 			return
 		}
 		response.Success(c, gin.H{"ok": true, "case_id": restoredID})
+	})
+	group.POST("/:id/quote", func(c *gin.Context) {
+		if store(c) == nil {
+			return
+		}
+		var input struct {
+			Version int                 `json:"version" binding:"required,min=1"`
+			Tokens  service.UsageTokens `json:"tokens"`
+		}
+		if err := c.ShouldBindJSON(&input); err != nil {
+			response.BadRequest(c, "Version and verified tokens are required")
+			return
+		}
+		u, err := h.gatewayService.QuoteBillingRecoveryUsage(c.Request.Context(), c.Param("id"), input.Version, input.Tokens)
+		if err != nil {
+			response.BadRequest(c, err.Error())
+			return
+		}
+		response.Success(c, gin.H{"usage_record": u})
 	})
 	group.POST("/:id/settle", func(c *gin.Context) {
 		if store(c) == nil {
