@@ -198,3 +198,9 @@ GitHub 安全检查发现原分支锁定的 DOMPurify 3.4.14 命中 GHSA-cg2g-xh
 ## 2026-10-23：授权提交与推送计费修复
 
 用户授权将上述超时观察、同步桥接、历史定价与 CSV 补记改动提交并推送 GitHub。核心沿用 `dev`，配套 extra 沿用 `main`，推送前两仓库均与远端同分支同步。保留自动 CI / Security 门禁及 fork 发行镜像渠道；推送只触发既有 GitHub 构建，不执行服务器更新、生产迁移或真实补扣。服务器须等待用户后续明确通知后再更新。
+
+## 2026-10-23：完整 CI 的空 Gateway 路由兼容修复
+
+首次推送 `d656e96bd` 的 Linux 完整 CI 发现原生 `TestClaudeResetRedeemRouteMatchesCodexResetProtection` 只构造管理员路由、不提供 Gateway；新增价格初始化在注册路由阶段解引用空处理器。此前计费专项和完整 handler 测试未运行 server/routes 包，未覆盖该场景；CI 门禁按设计阻止失败提交发行。
+
+`backend/internal/handler/billing_recovery_handler.go` 仅在提供 GatewayHandler 时初始化价格服务，保留空依赖时的原生路由注册行为。`billing_recovery_handler_test.go` 增加空 Gateway 注册不 panic、恢复未配置时列表返回 503 的回归，不修改原作者测试、认证中间件、计费或发行门禁。修改前本地复现原生路由测试同一 panic；修改后完整 handler / routes 单元测试及 Windows server 构建通过，两包 golangci-lint 为 0 issues，复核提交 diff --check。后续仍由完整 Linux CI 和安全检查决定是否发行。配套 extra 同一提交的运营中心 ARM64 QEMU 依赖安装曾触发 Illegal instruction，重跑后全部镜像构建成功，无需改动业务源码。

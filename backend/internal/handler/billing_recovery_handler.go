@@ -14,7 +14,9 @@ import (
 
 // Registered inside the existing admin authentication, rate-limit and audit boundary.
 func RegisterBillingRecoveryRoutes(admin *gin.RouterGroup, h *GatewayHandler) {
-	service.ConfigureBillingRecoveryPricing(h.gatewayService)
+	if h != nil {
+		service.ConfigureBillingRecoveryPricing(h.gatewayService)
+	}
 	group := admin.Group("/billing-recovery")
 	store := func(c *gin.Context) service.BillingRecoveryStore {
 		s := service.BillingRecovery()

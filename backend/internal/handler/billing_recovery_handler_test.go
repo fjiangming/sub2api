@@ -29,6 +29,18 @@ func (s *importHandlerStore) List(ctx context.Context, _ string, _, _ int) ([]se
 	return []service.BillingRecoveryCase{}, 0, nil
 }
 
+func TestBillingRecoveryHTTPRegistrationWithoutGateway(t *testing.T) {
+	service.ConfigureBillingRecovery(nil)
+	t.Cleanup(func() { service.ConfigureBillingRecovery(nil) })
+	router := gin.New()
+	require.NotPanics(t, func() {
+		RegisterBillingRecoveryRoutes(router.Group("/admin"), nil)
+	})
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/billing-recovery", nil))
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+}
+
 func TestBillingRecoveryImportHTTPValidatesBeforeReservation(t *testing.T) {
 	t.Setenv("BILLING_RECOVERY_ENABLED", "true")
 	store := &importHandlerStore{}
