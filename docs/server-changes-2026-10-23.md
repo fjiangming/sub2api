@@ -265,3 +265,59 @@ send_timeout 1860s;
 三个备份父目录和正式备份、files/ 原配置、deploy.py 依赖链、核验报告仍保留，合计约 0.783 GiB。清理前后保留条目逐文件 SHA-256 及生产配置散列核对一致；主站、PostgreSQL、Redis、运营中心的容器 ID、镜像、启动时间、重启次数及健康状态保持一致，未重启任何服务或修改业务数据。主站和运营中心本机及公网健康接口均为 200。
 
 逐项执行回执保存在 `/root/sub2api-deploy/backups/timeout-20261023110218/cleanup-20261023.json`，包含删除路径、占用、保留文件散列及前后服务状态。没有清理 Docker 镜像、生产数据卷、运行日志或其他既有备份目录。
+
+## 10. 2026-10-23 追加：客户端断开后继续保持 Nginx 回源
+
+用户授权后，于北京时间 **20:45:02** 完成 Nginx 配置调整并平滑重载。
+
+### 10.1 修改的配置
+
+仅修改 `/etc/nginx/conf.d/migrated-services.conf`，在以下三个域名的 `location /` 中，紧接 `proxy_pass http://127.0.0.1:9000;` 各增加一行：
+
+```nginx
+proxy_ignore_client_abort on;
+```
+
+- `epoint2api.fjmooo.cn`
+- `aihub.fo2.us.ci`
+- `aihubdirect.fo2.us.ci`
+
+文件差异仅三行新增，权限和属主保持原值。原有 1860s 读写超时及 `/monitor/` 等独立路由保持原值。其他被包含的 Nginx 文件散列均与调整前一致。
+
+该指令让 Nginx 在已转发请求的客户端断开后继续保持到 sub2api 的回源请求，以减少下游取消向应用传播造成的中断。对平滑重载后由新 worker 接收的请求生效；不延长 Cloudflare 的超时，不修改上游账号的访问地址。
+
+### 10.2 备份、新增文件与回滚
+
+本次材料统一存放在权限为 0700 的专用目录：
+
+```text
+/root/sub2api-deploy/backups/nginx-client-abort-20261023204501/
+```
+
+| 文件/目录 | 用途 |
+| --- | --- |
+| `nginx-config.before.tgz`、`files/etc/nginx/` | 完整 Nginx 配置归档，以及原主配置和目标配置 |
+| `migrated-services.candidate.conf`、`migrated-services.conf.diff` | 本次候选配置及仅增加三行的差异 |
+| `nginx-validation.conf` | 候选完整配置的独立语法校验入口，不加入生产 include |
+| `nginx-expanded.before.conf`、`nginx-expanded.after.conf` | 修改前后的 `nginx -T` 展开结果 |
+| `before.json`、`plan.json`、`commands.json`、`verification.json`、`external-verification.json`、`status.json`、`backup-manifest.json` | 配置散列、容器状态、内外网健康检查、执行回执及备份校验清单 |
+| `rollback.sh` | 恢复原目标配置、执行 `nginx -t` 并平滑重载 |
+| `SERVER-CHANGES.md` | 本清单的服务器副本 |
+
+另有 `/run/lock/sub2api-nginx-client-abort.lock`，仅用于本次配置过程的防并发锁，不是常驻服务或定时任务。
+
+需要撤销本次三行配置时，在服务器执行：
+
+```sh
+sh /root/sub2api-deploy/backups/nginx-client-abort-20261023204501/rollback.sh
+```
+
+此脚本恢复本次操作前的整份目标文件；如果之后还有其他 Nginx 调整，应先检查差异，避免覆盖后续修改。
+
+### 10.3 验证与业务影响
+
+候选完整配置及替换后的生产配置均通过 `nginx -t`；`systemctl reload nginx` 成功，主进程 PID 保持 1006，确认新 worker 已启动。三个域名通过本机 Host 请求 `/health` 均返回 200；从本地电脑访问 `https://epoint2api.fjmooo.cn/health` 和 `https://aihub.fo2.us.ci/health` 均返回 200。
+
+主站、PostgreSQL、Redis、运营中心的容器 ID、镜像、启动时间和重启次数保持一致；主站 Compose、`.env`、应用配置、价格文件散列保持一致。本次没有重启应用或数据库，没有更新镜像、切回原版、操作业务数据或执行补扣。
+
+未发起付费推理，也未进行真实 CF 125 秒断开后仍完整扣费的端到端验证。该设置保护 Nginx 到应用这一段连接；上游自身断流、应用退出或无法取得最终用量仍需其他机制处理。

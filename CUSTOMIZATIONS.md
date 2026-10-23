@@ -1,7 +1,8 @@
 # 个性化代码维护台账
 
 日期：2026-10-23。Fork：`fjiangming/sub2api`，分支：`dev`。
-基线：`dba770d56a0ee0ae5bad1b3dc5e11614d323163c`。
+初始基线：`dba770d56a0ee0ae5bad1b3dc5e11614d323163c`。
+当前上游集成基线：`v0.2.18`（`ac1b8f1271be0d674fa6f074403c1410f30a3a81`）及其仅同步 VERSION 的后续提交 `5c185c5c5d4f5e409e2139806e0964ae944e03e8`。
 原作者仓库：`Wei-Shaw/sub2api`，本地 remote `upstream`。
 
 ## 给后续 AI 的要求
@@ -204,3 +205,36 @@ GitHub 安全检查发现原分支锁定的 DOMPurify 3.4.14 命中 GHSA-cg2g-xh
 首次推送 `d656e96bd` 的 Linux 完整 CI 发现原生 `TestClaudeResetRedeemRouteMatchesCodexResetProtection` 只构造管理员路由、不提供 Gateway；新增价格初始化在注册路由阶段解引用空处理器。此前计费专项和完整 handler 测试未运行 server/routes 包，未覆盖该场景；CI 门禁按设计阻止失败提交发行。
 
 `backend/internal/handler/billing_recovery_handler.go` 仅在提供 GatewayHandler 时初始化价格服务，保留空依赖时的原生路由注册行为。`billing_recovery_handler_test.go` 增加空 Gateway 注册不 panic、恢复未配置时列表返回 503 的回归，不修改原作者测试、认证中间件、计费或发行门禁。修改前本地复现原生路由测试同一 panic；修改后完整 handler / routes 单元测试及 Windows server 构建通过，两包 golangci-lint 为 0 issues，复核提交 diff --check。后续仍由完整 Linux CI 和安全检查决定是否发行。配套 extra 同一提交的运营中心 ARM64 QEMU 依赖安装曾触发 Illegal instruction，重跑后全部镜像构建成功，无需改动业务源码。
+
+## 2026-10-23：Nginx 保持客户端断开后的回源请求
+
+用户明确授权配置 `proxy_ignore_client_abort on;`，北京时间 20:45:02 完成。服务器 `/etc/nginx/conf.d/migrated-services.conf` 仅在 `epoint2api.fjmooo.cn`、`aihub.fo2.us.ci`、`aihubdirect.fo2.us.ci` 三个域名代理到 `http://127.0.0.1:9000` 的 `location /` 中各新增一行该指令。保留原有 1860s 超时及其他路由；后续生成或替换 Nginx 配置须保留此项部署覆盖。
+
+先核对远端配置与候选差异只有三行，备份整个 `/etc/nginx` 及原文件，再通过独立入口验证候选完整配置。原子替换后再次执行 `nginx -t` 和 `systemctl reload nginx`；主进程 PID 1006 保持不变，确认新 worker 启动，三个域名的本机 Host 回源 `/health` 均为 200；从本地访问 epoint2api 和 aihub 的公网 HTTPS `/health` 也均为 200。其余 Nginx 被包含文件和主站 Compose / .env / 应用配置 / 价格文件散列保持一致；主站、PostgreSQL、Redis、运营中心的容器身份、镜像、启动时间及重启次数保持一致，没有操作业务数据或部署新镜像。
+
+所有服务器备份、候选、差异、前后配置展开、校验回执和 `rollback.sh` 统一放在 `/root/sub2api-deploy/backups/nginx-client-abort-20261023204501/`，目录权限 0700。配置过程使用 `/run/lock/sub2api-nginx-client-abort.lock` 防并发，不增加常驻服务。`docs/server-changes-2026-10-23.md` 同步追加此项，服务器副本放在本次备份目录的 `SERVER-CHANGES.md`。本轮仅记录配置维护，不提交或推送 GitHub。
+
+此项使新请求在客户端或 CF 断开后由 Nginx 继续保持到应用的回源连接，不延长 CF 自身超时，也不改变上游供应商线路。未发起收费推理或生产补扣，未进行真实 125 秒断开后的长请求计费验证；不能将健康检查视为所有漏费场景均已修复。
+
+## 2026-10-23：集成原作者 v0.2.18
+
+用户授权评估并合并原作者最新版。先在现有 dev HEAD `899e5f98e07fdd08806294393aa12de5de97e776` 上创建本地集成分支 `codex/integrate-upstream-v0.2.18`，再合并上游 `5c185c5c5d4f5e409e2139806e0964ae944e03e8`；该提交仅比正式发布 tag 多将 VERSION 从 0.2.17 同步到 0.2.18。完成验证后回到 dev，以 fast-forward 保留可追溯的上游合并历史。本轮不推送 GitHub、不触发发行、不更新服务器或生产数据。
+
+建议集成的原因是 OpenAI/Codex 的出站身份和空响应失败恢复得到修复。DOMPurify 3.4.17 安全升级已在 fork 中提前完成，自动合并没有重复变更。新增上游内容不替代计费恢复机制，也没有数据库迁移。先前未提交的 Nginx 维护台账和服务器改动清单随本次本地提交保留。
+
+| 上游文件 | 本轮集成内容及个性化兼容性 |
+| --- | --- |
+| `backend/internal/pkg/openai/request.go`、`request_codex_identity_normalization_test.go` | 默认使用 CLI 身份，成对归一化历史 TUI 的 originator / UA，并验证配对及幂等；不改变计费请求归属。 |
+| `backend/internal/service/openai_codex_identity.go`、`openai_gateway_service.go`、`setting_gateway_runtime.go`、`settings_view.go` | 同步规范 Codex 身份及说明，保留版本来源和账号自定义 OS / 终端指纹。 |
+| `backend/internal/service/openai_gateway_passthrough.go`、`openai_gateway_upstream_errors.go`、`openai_capacity_shed_test.go` | 空文本 / 空片段不再误判已输出，保留实际内容和工具调用的重试边界；尊重请求级 Retry-After，最多等待 8 秒。沿用原生 failover；每次实际 dispatch 的持久意图及客户端已断开禁止新 dispatch 的 fork 保护保持原样。 |
+| `backend/internal/service/openai_codex_identity_test.go`、`openai_codex_version_sync_service_test.go`、`openai_oauth_passthrough_test.go`、`openai_setup_token_compat_test.go`、`openai_ws_forwarder_success_test.go` | 原作者相应身份回归更新，未删除或降低 fork 计费测试。 |
+| `frontend/src/i18n/locales/en/admin/settings.ts`、`frontend/src/i18n/locales/zh/admin/settings.ts` | 更新 Codex 配置示例与说明；不改版本按钮和核查入口。 |
+| `backend/cmd/server/VERSION` | 基础版本改为 0.2.18；后续 dev push 仍按既有 fork 公式生成 0.2.18 系列独立版本和 GHCR 镜像。 |
+| `README.md`、`README_CN.md`、`README_JA.md`、`assets/partners/logos/ooko.ai.png` | 接收原作者的合作伙伴资料更新。 |
+| `CUSTOMIZATIONS.md`、`docs/server-changes-2026-10-23.md` | 更新当前上游基线和本节，并保留前一轮已完成的 Nginx 配置记录。 |
+
+冲突检查：自动合并没有 unmerged 文件；21 个上游增量文件与 fork 的 49 个既有改动文件没有源代码交集。另有本地台账和服务器清单两份文档待提交。47 个既有个性化代码 / 配置 / 测试文件的 Git 内容与合并前一致，包含三项 custom 迁移、原生 Apply 事务挂接、价格快照、独立请求期限、同步 SSE 桥接、CSV 防重、fork 更新源、dev 发行门禁及镜像地址。运营中心工程本轮无改动。
+
+验证：`internal/pkg/openai`、repository、handler、middleware、routes 五个完整单元测试包通过；service 中 `BillingRecovery|Codex|CapacityShed|OpenAIStream|OpenAIOAuth|OpenAISetup|OpenAIWSForward|UsageRecordWorkerPool` 专项通过，覆盖新增空流 / Retry-After / 身份回归及原计费保护。4 项真实 PostgreSQL/PGlite 回归、7 项 fork 发行门禁回归、前端完整 build（含 3 项 i18n 检查和 TypeScript）、Linux amd64 嵌入前端二进制构建通过。golangci-lint 2.14.0 检查上述六个完整 Go 包为 0 issues；diff --check 通过。
+
+Windows service 全包测试仍只有此前台账记录的 `TestCommandCodeGatewayPassesThroughCatalogProtocols`（模型目录测试基于 UnixNano 产生的地址重复）和 `TestOllamaProbeCallback_StaleLongDoesNotOverrideNewShort`（短时间窗口 / CAS）失败；这两个测试及其对应实现的 Git 内容与合并前一致，没有为通过本次合并删除测试或放宽断言。不能将本轮结果描述为全量测试通过。本轮未运行 Linux 全量单元 / Docker 集成测试、真实上游付费请求或 GitHub CI；后续发行继续由未改动的完整 CI / Security 门禁决定。
