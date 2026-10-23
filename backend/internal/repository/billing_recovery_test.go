@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"io"
@@ -82,6 +83,71 @@ func TestBillingRecoveryMissingPricingIsPersistedForReview(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "case-1", id)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestBillingRecoveryReadsNullableJSON(t *testing.T) {
+	at := time.Date(2026, 10, 23, 0, 0, 0, 0, time.UTC)
+	snapshot := `{"account_type":"apikey","account_quota":false}`
+	for _, fixture := range []struct {
+		name, state, filter, observedJSON string
+		observed, usage, command          driver.Value
+	}{
+		{name: "awaiting response", state: "unknown", filter: "unknown"},
+		{name: "prepared without HTTP observation", state: "prepared", filter: "pending",
+			usage: []byte(`{"Model":"test","ActualCost":0.25}`), command: []byte(`{"RequestID":"recover-1"}`)},
+		{name: "observed usage", state: "unknown", filter: "",
+			observed: []byte(`{"input_tokens":13}`), observedJSON: `{"input_tokens":13}`},
+		{name: "JSON null observation", state: "unknown", filter: "unknown",
+			observed: []byte(`null`), observedJSON: `null`},
+	} {
+		for _, operation := range []string{"get", "list"} {
+			t.Run(fixture.name+"/"+operation, func(t *testing.T) {
+				db, mock, err := sqlmock.New()
+				require.NoError(t, err)
+				defer func() { _ = db.Close() }()
+				rows := sqlmock.NewRows(strings.Split(recoveryColumns, ",")).AddRow(
+					"case-1", "root-1", int64(1), int64(2), nil, nil, int64(3), "anthropic", "/v1/messages", "test", "", fixture.state,
+					nil, fixture.observed, fixture.usage, fixture.command, "", "", 0, 1, at, at, at, true, nil, []byte(snapshot))
+				repo := &billingRecoveryRepository{db: db}
+				var result *service.BillingRecoveryCase
+				if operation == "get" {
+					mock.ExpectQuery("SELECT id,request_root").WithArgs("case-1").WillReturnRows(rows)
+					result, err = repo.Get(context.Background(), "case-1")
+					require.NoError(t, err)
+				} else {
+					mock.ExpectQuery("SELECT count").WithArgs(fixture.filter).
+						WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+					mock.ExpectQuery("SELECT id,request_root").WithArgs(fixture.filter, 20, 0).WillReturnRows(rows)
+					items, total, listErr := repo.List(context.Background(), fixture.filter, 20, 0)
+					require.NoError(t, listErr)
+					require.EqualValues(t, 1, total)
+					require.Len(t, items, 1)
+					result = &items[0]
+				}
+				require.Equal(t, fixture.state, result.State)
+				require.Nil(t, result.HTTPStatus)
+				if fixture.observedJSON == "" {
+					require.Nil(t, result.ObservedUsage)
+				} else {
+					require.JSONEq(t, fixture.observedJSON, string(result.ObservedUsage))
+				}
+				require.JSONEq(t, snapshot, string(result.Snapshot))
+				if fixture.usage == nil {
+					require.Nil(t, result.Usage)
+					require.Nil(t, result.Command)
+				} else {
+					require.NotNil(t, result.Usage)
+					require.Equal(t, "test", result.Usage.Model)
+					require.InDelta(t, 0.25, result.Usage.ActualCost, 0)
+					require.NotNil(t, result.Command)
+					require.Equal(t, "recover-1", result.Command.RequestID)
+				}
+				_, err = json.Marshal(result)
+				require.NoError(t, err)
+				require.NoError(t, mock.ExpectationsWereMet())
+			})
+		}
+	}
 }
 
 type observationStore struct {

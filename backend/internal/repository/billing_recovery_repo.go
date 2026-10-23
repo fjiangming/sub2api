@@ -102,11 +102,13 @@ type recoveryScanner interface{ Scan(...any) error }
 
 func scanRecovery(row recoveryScanner) (*service.BillingRecoveryCase, error) {
 	c := &service.BillingRecoveryCase{}
-	var usage, command []byte
-	err := row.Scan(&c.ID, &c.RequestRoot, &c.UserID, &c.APIKeyID, &c.GroupID, &c.SubscriptionID, &c.AccountID, &c.Platform, &c.Endpoint, &c.Model, &c.UpstreamRequestID, &c.State, &c.HTTPStatus, &c.ObservedUsage, &usage, &command, &c.Evidence, &c.LastError, &c.Attempts, &c.Version, &c.CreatedAt, &c.UpdatedAt, &c.NextRetryAt, &c.CachePending, &c.ParentCaseID, &c.Snapshot)
+	// database/sql accepts SQL NULL into []byte, but not directly into json.RawMessage.
+	var observed, usage, command, snapshot []byte
+	err := row.Scan(&c.ID, &c.RequestRoot, &c.UserID, &c.APIKeyID, &c.GroupID, &c.SubscriptionID, &c.AccountID, &c.Platform, &c.Endpoint, &c.Model, &c.UpstreamRequestID, &c.State, &c.HTTPStatus, &observed, &usage, &command, &c.Evidence, &c.LastError, &c.Attempts, &c.Version, &c.CreatedAt, &c.UpdatedAt, &c.NextRetryAt, &c.CachePending, &c.ParentCaseID, &snapshot)
 	if err != nil {
 		return nil, err
 	}
+	c.ObservedUsage, c.Snapshot = observed, snapshot
 	if len(usage) > 0 {
 		if err = json.Unmarshal(usage, &c.Usage); err != nil {
 			return nil, err

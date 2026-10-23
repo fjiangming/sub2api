@@ -107,3 +107,17 @@ GitHub 安全检查发现原分支锁定的 DOMPurify 3.4.14 命中 GHSA-cg2g-xh
 发行 run 39864676105 已推送版本镜像，但 `gh release create --target SHA` 返回 HTTP 403 / Resource not accessible by integration；job 实际已有 contents:write。构建期间 dev 已推进且工作流变更，旧 SHA 尚无 tag，符合 GitHub 对无既有引用的历史提交发行所施加的 workflows 权限限制（GitHub 2023-11-02 changelog）。不扩大长期 Token 权限，不用新 HEAD 冒充旧产物来源。
 
 自定义工作流的 version job 在长时间构建前，用该 job 的短期 GITHUB_TOKEN 预先推送完整 SHA 对应的不可变轻量 tag；已有 tag 必须同 SHA，禁止强推。publish 再核对远端 tag 的 SHA，并用 --verify-tag 创建 Release，不再让 Release API 隐式创建历史 tag。失败的检查/构建可能留下 tag，但不会产生正式 Release 或提升 latest；GITHUB_TOKEN 推 tag 不递归触发原生 tag release 流程。YAML、所有 Bash 块及 tag / publish 的依赖关系需持续核验。
+
+## 2026-10-23：生产改动清单归档
+
+新增 `docs/server-changes-2026-10-23.md`，根据本次服务器部署前文件/数据库备份和部署后实况记录两份 Compose 的 image / pull_policy、运营中心加密持久认证、计费恢复 schema、容器替换、备份和演练目录及临时维护标记；`.gitignore` 仅为此文档增加精确白名单，避免被原有 docs/* 规则忽略。服务器副本放在 `/root/sub2api-deploy/backups/billing-fix-20261023072212/SERVER-CHANGES.md`，追加脱敏文件/数据库差异核对 JSON；本次整理不改变运行配置或触发重启。
+
+额外核实原作者 `246_enable_gemini_image_generation_groups.sql` 同计费迁移一起执行，将生产分组 60、62、68、71 的 allow_image_generation 从 false 改为 true，已在清单列明。这是本次镜像启动时的既有迁移效果，未人工回退。原有 504809 条使用记录在上线验收时完整保留；原 90 天策略启动时过期的 5 条零元记录已原样恢复，策略仍有效。验证：两份 Compose 完整 YAML 结构比较仅各 2 项不同；env/Nginx/主站配置和价格文件逐字节比较；卷内原密钥与成本台账一致；升级前 dump 对比确认新增 2 项迁移及仅 sub2api_custom 的关系对象，原关系对象无删除。此次仅文档和台账，未推送，也未触发新构建。
+
+## 2026-10-23：修复计费核查列表 / 详情读取 SQL NULL
+
+生产 unknown / 全部状态列表返回主站 HTTP 500，经运营中心转为 502。日志定位到 scanRecovery 将 observed_usage 的 SQL NULL 直接扫描到 *json.RawMessage（Go 1.27 中为 *jsontext.Value）失败；等待上游响应的正常意图和未经过 HTTP 观察器的 prepared 记录均可能包含该空值。此前只验收空的 pending 列表，未覆盖含这类真实记录的读取。
+
+`backend/internal/repository/billing_recovery_repo.go` 仅将 observed_usage 和 request_snapshot 先读到可接受 SQL NULL 的 []byte，再赋给 API 的 JSON 字段，保留 SQL NULL、JSON null 和已有用量的区别。列表、详情和结算恢复读取共用此修复；不改迁移、历史记录、定价、资金事务或上游请求。`backend/internal/repository/billing_recovery_test.go` 新增使用真实 database/sql Scan 转换的 8 个回归子场景，覆盖 unknown、无 HTTP observation 的 prepared / pending、数值用量和 JSON null，分别验证 Get / List、历史快照和已准备的使用记录 / 命令保持原值。
+
+验证：修复前 4 个 SQL NULL 子场景复现与生产完全相同的错误；修复后全部计费恢复回归通过，完整 repository 单元测试通过。Windows 完整测试需将实际 Git 安装目录 E:/Git/usr/bin 加入本次进程 PATH，未改动原作者备份测试。生产只读核对确认 SQL NULL 意图仍保留、已结算事项均对应 usage_logs；发布继续经过 dev 自动工作流的完整 CI / Security 门禁，服务器通过镜像更新，备份仍统一置于 /root/sub2api-deploy/backups/ 的本次专用子目录。
