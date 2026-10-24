@@ -38,6 +38,34 @@ func RegisterBillingRecoveryRoutes(admin *gin.RouterGroup, h *GatewayHandler) {
 		}
 		response.ErrorFrom(c, err)
 	}
+	group.POST("/imports/quote", func(c *gin.Context) {
+		if store(c) == nil {
+			return
+		}
+		var input struct {
+			Source service.BillingRecoveryImport `json:"source" binding:"required"`
+			Tokens service.UsageTokens           `json:"tokens"`
+		}
+		if err := c.ShouldBindJSON(&input); err != nil {
+			response.BadRequest(c, "Verified source and tokens are required")
+			return
+		}
+		if h == nil || h.apiKeyService == nil || h.gatewayService == nil {
+			response.Error(c, http.StatusServiceUnavailable, "Import pricing is unavailable")
+			return
+		}
+		key, err := h.apiKeyService.GetByID(c.Request.Context(), input.Source.APIKeyID)
+		if err != nil {
+			respondError(c, err)
+			return
+		}
+		quote, err := h.gatewayService.QuoteBillingImportUsage(c.Request.Context(), &input.Source, key, input.Tokens)
+		if err != nil {
+			response.BadRequest(c, err.Error())
+			return
+		}
+		response.Success(c, quote)
+	})
 	group.POST("/imports/reserve", func(c *gin.Context) {
 		s := store(c)
 		if s == nil {

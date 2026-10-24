@@ -186,12 +186,14 @@ func TestBillingRecoveryManualRecordPreservesOwnershipAndChargesDifference(t *te
 
 func TestBillingRecoveryHistoricalImportKeepsOriginalDeadline(t *testing.T) {
 	t.Setenv("BILLING_RECOVERY_ENABLED", "true")
-	for _, scenario := range []string{"historical", "normal", "recent", "already_restored"} {
+	for _, scenario := range []string{"historical", "historical_log", "normal", "recent", "already_restored"} {
 		t.Run(scenario, func(t *testing.T) {
 			entry := &BillingRecoveryCase{ID: "case", RequestRoot: "historical-error:10:0", Version: 1,
 				State: "review", UserID: 1, APIKeyID: 2, AccountID: 3,
 				CreatedAt: time.Now().Add(-3 * time.Hour), UpdatedAt: time.Now()}
 			switch scenario {
+			case "historical_log":
+				entry.RequestRoot = "historical-log:server-request"
 			case "normal":
 				entry.RequestRoot = "dispatch:normal"
 			case "recent":
@@ -205,7 +207,7 @@ func TestBillingRecoveryHistoricalImportKeepsOriginalDeadline(t *testing.T) {
 			gateway := &GatewayService{accountRepo: recoveryAccountRepo{}}
 			_, err := gateway.RestoreBillingRecoveryUsage(context.Background(), "case", 1,
 				&APIKey{ID: 2, User: &User{ID: 1}}, &UsageLog{Model: "test", InputTokens: 1, TotalCost: 0.1, RateMultiplier: 1}, "historical CSV evidence", "admin:9")
-			if scenario == "historical" {
+			if scenario == "historical" || scenario == "historical_log" {
 				require.NoError(t, err)
 				require.Equal(t, entry.CreatedAt, store.usage.CreatedAt)
 				require.Equal(t, 0.1, store.command.BalanceCost)

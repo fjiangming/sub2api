@@ -15,8 +15,8 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// Pricing is frozen before dispatch. Recovery never substitutes today's price
-// table or the provider's purchase cost for the user's historical selling price.
+// Pricing is frozen before dispatch. Automated recovery preserves that price;
+// CSV imports without a snapshot can explicitly quote current prices for review.
 var recoveryPricingGateway atomic.Pointer[GatewayService]
 
 func ConfigureBillingRecoveryPricing(gateway *GatewayService) { recoveryPricingGateway.Store(gateway) }
@@ -98,6 +98,13 @@ type recoveryPricePlan struct {
 
 func snapshotRecoveryPrice(ctx context.Context, state *billingRequestState, model string, req *http.Request) *recoveryPricePlan {
 	s := recoveryPricingGateway.Load()
+	if s == nil {
+		return nil
+	}
+	return s.recoveryPricePlan(ctx, state, model, req)
+}
+
+func (s *GatewayService) recoveryPricePlan(ctx context.Context, state *billingRequestState, model string, req *http.Request) *recoveryPricePlan {
 	ingress := state.Ingress.Load()
 	if s == nil || s.billingService == nil || state.Key == nil || ingress == nil || strings.TrimSpace(model) == "" {
 		return nil
@@ -198,6 +205,10 @@ func (s *GatewayService) QuoteBillingRecoveryUsage(ctx context.Context, id strin
 	if entry.Version != version {
 		return nil, ErrBillingRecoveryConflict
 	}
+	return s.quoteRecoveryEntry(entry, tokens)
+}
+
+func (s *GatewayService) quoteRecoveryEntry(entry *BillingRecoveryCase, tokens UsageTokens) (*UsageLog, error) {
 	if s.billingService == nil || tokens.ImageInputTokens != 0 || tokens.ImageOutputTokens != 0 || tokens.ImageCacheReadTokens != 0 {
 		return nil, fmt.Errorf("historical token pricing does not cover this request")
 	}

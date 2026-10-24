@@ -201,3 +201,77 @@ func TestBillingRecoveryImportDateRangeKeepsPaginationParameters(t *testing.T) {
 	require.Zero(t, total)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestBillingRecoveryLogImportChecksArchiveAndQuotesWithoutWrites(t *testing.T) {
+	for _, scenario := range []string{"inspect", "reserve", "already_billed"} {
+		t.Run(scenario, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			defer func() { _ = db.Close() }()
+			in := recoveryImportInput()
+			in.CaseID, in.Version = "", 0
+			in.LogSource = &service.BillingRecoveryLogSource{RequestID: "server-log-id", ClientID: "client-log-id", GroupID: 7,
+				Model: in.Model, EndedAt: in.StartedAt.Add(125 * time.Second), LatencyMS: 125000, StatusCode: 499, Digest: strings.Repeat("c", 64)}
+			if scenario == "reserve" {
+				expectImportLock(mock)
+				mock.ExpectQuery("SELECT case_id,account_id").WillReturnError(sql.ErrNoRows)
+			} else {
+				mock.ExpectBegin()
+			}
+			mock.ExpectQuery("SELECT platform FROM accounts").WithArgs(3).WillReturnRows(sqlmock.NewRows([]string{"platform"}).AddRow("anthropic"))
+			mock.ExpectQuery(`(?s)SELECT EXISTS.*usage_billing_dedup_archive`).
+				WithArgs(1, 2, 3, `{"server-log-id","client-log-id","client:server-log-id","client:client-log-id"}`).
+				WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(scenario == "already_billed"))
+			if scenario != "already_billed" {
+				mock.ExpectQuery("SELECT subscription_type FROM groups").WithArgs(7).WillReturnRows(sqlmock.NewRows([]string{"type"}).AddRow("standard"))
+			}
+			if scenario == "reserve" {
+				mock.ExpectExec("INSERT INTO sub2api_custom.billing_recovery").WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectExec("INSERT INTO sub2api_custom.billing_import_claims").WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectExec("INSERT INTO sub2api_custom.billing_recovery_events").WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectCommit()
+				_, err = (&billingRecoveryRepository{db: db}).ReserveImport(context.Background(), in, "admin:9")
+				require.NoError(t, err)
+			} else {
+				mock.ExpectRollback()
+				entry, readErr := (&billingRecoveryRepository{db: db}).ImportSource(context.Background(), in)
+				if scenario == "already_billed" {
+					require.ErrorIs(t, readErr, service.ErrBillingRecoveryConflict)
+				} else {
+					require.NoError(t, readErr)
+					require.Equal(t, "historical-log:server-log-id", entry.RequestRoot)
+					require.EqualValues(t, 7, *entry.GroupID)
+					require.Equal(t, in.StartedAt, entry.CreatedAt)
+				}
+			}
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestBillingRecoveryLogImportRejectsIncompleteAndConflictingSources(t *testing.T) {
+	for _, scenario := range []string{"no_id", "bad_digest", "wrong_model", "live", "bad_latency", "success", "two_sources"} {
+		in := recoveryImportInput()
+		in.CaseID, in.Version = "", 0
+		in.LogSource = &service.BillingRecoveryLogSource{RequestID: "server-id", GroupID: 7, Model: "test", Digest: strings.Repeat("c", 64),
+			EndedAt: in.StartedAt.Add(125 * time.Second), LatencyMS: 125000, StatusCode: 499}
+		switch scenario {
+		case "no_id":
+			in.LogSource.RequestID = ""
+		case "bad_digest":
+			in.LogSource.Digest = "unverified"
+		case "wrong_model":
+			in.LogSource.Model = "other"
+		case "live":
+			in.LogSource.EndedAt = time.Now()
+		case "bad_latency":
+			in.LogSource.LatencyMS = 1
+		case "success":
+			in.LogSource.StatusCode = 200
+		case "two_sources":
+			in.ErrorID = 10
+		}
+		_, err := (&billingRecoveryRepository{}).ReserveImport(context.Background(), in, "admin:9")
+		require.ErrorIs(t, err, service.ErrBillingRecoveryConflict, scenario)
+	}
+}

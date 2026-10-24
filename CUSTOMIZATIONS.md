@@ -20,7 +20,7 @@
 4. 带历史价格的使用记录与命令先持久化；usage_logs、原生 dedup、资金效果同事务提交。
 5. 恢复只能调用原生 UsageBillingRepository.Apply；禁止用用户管理 API 直接减余额。
 6. 重复恢复不重复扣费；不同实际 dispatch 使用不同资金事件 ID，防止复用客户端请求 ID 少扣。
-7. 人工补记须经过 review → prepared → settled；归属、最终用量、历史价格和证据必须核对。
+7. 人工补记须经过 review → prepared → settled；归属、最终用量、价格来源和证据必须核对。历史价格快照不可覆盖；CSV 旧请求缺快照时允许明确标注当前主站报价并经管理员确认，不将当前价冒充历史价。
 8. 已结算记录保留原账，额外用量生成独立差额记录；后续差额基于最后已结算子节点继续。
 9. 保留原作者图片/视频/搜索/缓存等强制稳定资金事件 ID 的幂等语义。
 10. 更新来源固定本 fork；更新缓存、回滚命令和安装脚本不能切回原作者发行版。
@@ -238,3 +238,28 @@ GitHub 安全检查发现原分支锁定的 DOMPurify 3.4.14 命中 GHSA-cg2g-xh
 验证：`internal/pkg/openai`、repository、handler、middleware、routes 五个完整单元测试包通过；service 中 `BillingRecovery|Codex|CapacityShed|OpenAIStream|OpenAIOAuth|OpenAISetup|OpenAIWSForward|UsageRecordWorkerPool` 专项通过，覆盖新增空流 / Retry-After / 身份回归及原计费保护。4 项真实 PostgreSQL/PGlite 回归、7 项 fork 发行门禁回归、前端完整 build（含 3 项 i18n 检查和 TypeScript）、Linux amd64 嵌入前端二进制构建通过。golangci-lint 2.14.0 检查上述六个完整 Go 包为 0 issues；diff --check 通过。
 
 Windows service 全包测试仍只有此前台账记录的 `TestCommandCodeGatewayPassesThroughCatalogProtocols`（模型目录测试基于 UnixNano 产生的地址重复）和 `TestOllamaProbeCallback_StaleLongDoesNotOverrideNewShort`（短时间窗口 / CAS）失败；这两个测试及其对应实现的 Git 内容与合并前一致，没有为通过本次合并删除测试或放宽断言。不能将本轮结果描述为全量测试通过。本轮未运行 Linux 全量单元 / Docker 集成测试、真实上游付费请求或 GitHub CI；后续发行继续由未改动的完整 CI / Security 门禁决定。
+
+## 2026-10-24：CSV 自动读取主站价格与历史日志来源
+
+用户同意简化 CSV 补记流程，要求尽量不手配售卖规则。此轮核心在 `dev` 本地实现，配套运营编排和界面仍放在 extra。保留此前独立的生产镜像通道台账及服务器改动清单；没有推送、发行、部署、连接生产或补扣真实用户。
+
+| 文件 | 本轮增量与后续集成要求 |
+| --- | --- |
+| `backend/internal/service/billing_recovery_import.go` | 新增管理员核对的结构化 `log_source` DTO 和可选只读来源接口，不扩大已有通用 store 接口；CSV 解析、匹配和原文件读取仍在运营中心。 |
+| `backend/internal/repository/billing_recovery_import.go` | 提取历史来源检查，新增只读 ImportSource；完整失败日志可创建 `historical-log:` review 案件，不向 ops_error_logs 造记录。校验服务端 ID、用户 / Key / 账号 / 分组、模型、结束时间 / 耗时 / 失败状态及原请求期限；排除已有原生用量、持久意图和 dedup / 归档，包含原生 client: 前缀。预留仍复用账号锁、同账单 / 同来源双重唯一和原事务，来源固定为 log:服务端ID，无新迁移。 |
+| `backend/internal/service/billing_recovery_import_quote.go`（新增） | 只读导入报价：优先保持历史快照；缺失时复用原生模型 / 渠道定价、区间 / 时间策略、用户 / 原分组倍率和账号成本规则。Key 后来迁移分组仍读取原分组。不支持的已有快照、未知模型 / 价格或归属不一致拒绝报价，不能用当前价掩盖已知维度。返回 immutable_dispatch_snapshot / current_sub2api_prices 和报价时间；当前报价只改临时对象，不写快照、案件、预留或资金。 |
+| `backend/internal/service/billing_recovery_pricing.go` | 提取现有价格计划及报价共用函数，运输前快照和原异常报价继续使用相同原生计算；自动恢复依旧不代入当前价。 |
+| `backend/internal/handler/billing_recovery_handler.go` | 原管理员边界下新增 POST /api/v1/admin/billing-recovery/imports/quote，接受已核对来源与 Token；复用原生 Key / Gateway 服务，无依赖时 503，不在注册路由时解引用空 Gateway。 |
+| `backend/internal/service/billing_recovery_usage.go` | 首次历史日志 staging 与历史错误享有相同的一分钟豁免，仍强制原请求超过独立期限加一分钟；资金继续走 Restore / review / 原生 Apply。 |
+| `backend/internal/service/billing_recovery_import_quote_test.go`（新增） | Claude / OpenAI / Gemini 原生报价、分组 0.9 / 用户 0.6 覆盖、账号 0.79 不叠乘、历史快照保持、已知不支持维度 / 归属阻断、Key 迁组后原分组报价及不修改原快照。 |
+| `backend/internal/repository/billing_recovery_import_test.go` | 只读日志检查、日志 staging、防重归档及 ID / 摘要 / 状态 / 时间 / 模型 / 混合来源校验；预览不能创建案件或资金效果。 |
+| `backend/internal/handler/billing_recovery_handler_test.go`、`backend/internal/service/billing_recovery_test.go` | 新报价接口输入 / 空依赖返回及不预留来源，历史日志 staging 豁免不能绕过原请求期限。 |
+| `CUSTOMIZATIONS.md` | 更新当前价格例外和本节，配套说明见 extra 的 operations-center/docs/billing-csv-import.md。 |
+
+本节取代此前“缺历史快照必须手填历史价格”的 CSV 默认操作要求，但不会更改过去记录、已有快照或后台核查草稿策略。当前价不能证明请求发生时的售价；运营中心必须显式展示来源和报价时间，最终人工确认包含这一项。原有人工历史规则仍是可选覆盖，不能覆盖明确不支持标准 Token 的快照。用户扣费按主站标准费乘用户 / 分组倍率，账号倍率仅参与账号成本 / 限额，不能把上游支出换算直接当售价。
+
+日志摘要为完整关联事件的 SHA-256，属于受管理员认证保护的来源声明，不是签名。核心不独立读取或认证原文件；运营中心须从本机只读挂载提取完整关联、核对原生实体，并在首次确认前重读证据。核心在确认时再次校验和原生去重，后续仍由同一 Apply 事务写使用记录、dedup 和资金。价格缺失、来源 / 订阅有歧义或未知 Token 仍待核查。主站与运营中心需配套升级；此次无数据库迁移或发行通道改动。
+
+验证：service / repository / handler / routes 的 BillingRecovery、UsageBilling、RecordUsage 专项通过（routes 无命中用例）；新报价接口及 Key 迁组回归另行通过。4 项真实 PostgreSQL/PGlite 回归、Windows server 构建通过。golangci-lint 2.14.0 以原 CI 默认配置检查三个完整包，结果 0 issues；额外启用 unit 标签的 lint 曾暴露原生未改动测试文件中的依赖 / 返回值 / staticcheck 等告警，未因此改动它们，本轮新增报价文件的一处无效赋值已修复并复测。不能将这些结果表述为 Linux 全量测试或所有标签 lint 均通过。配套运营中心 225 项全量测试、check、四组桌面 / 手机模拟流程及离线回放通过，详细数量见 extra 台账；两仓库 diff --check 通过。尚未进行实际服务器定价读取、真实资金结算、Docker / Linux CI 或 GitHub 发布，新增与修改文件均保留本地供后续审核。
+
+用户随后授权验证后推送 GitHub。提交本节的 CSV 自动报价、完整日志来源及配套测试 / 台账到 dev，extra 配套提交到 main；沿用现有 CI / Security 门禁及 fork Release / GHCR 通道，不修改发行配置。推送前 fetch 确认两仓库均与目标分支同步，复核改动及验证记录。此前独立的生产镜像通道维护台账和服务器改动清单继续保留本地未提交，不纳入本次功能提交；不部署服务器或操作真实资金。推送成功只代表代码已上传，构建 / 发布结果以本次完整 SHA 的 Actions 为准。

@@ -69,6 +69,33 @@ func TestBillingRecoveryImportHTTPValidatesBeforeReservation(t *testing.T) {
 	}
 }
 
+func TestBillingRecoveryImportQuoteHTTPRejectsInvalidInputAndMissingGateway(t *testing.T) {
+	t.Setenv("BILLING_RECOVERY_ENABLED", "true")
+	store := &importHandlerStore{}
+	service.ConfigureBillingRecovery(store)
+	t.Cleanup(func() { service.ConfigureBillingRecovery(nil) })
+	in := service.BillingRecoveryImport{AccountID: 3, BillIdentity: strings.Repeat("a", 64), PayloadDigest: strings.Repeat("b", 64),
+		UserID: 1, APIKeyID: 2, ErrorID: 10, EventIndex: -1, StartedAt: time.Now().Add(-4 * time.Hour), Model: "test", Evidence: "verified historical CSV"}
+	valid, err := json.Marshal(map[string]any{"source": in, "tokens": service.UsageTokens{InputTokens: 1000}})
+	require.NoError(t, err)
+	for _, gateway := range []*GatewayHandler{nil, {}} {
+		router := gin.New()
+		RegisterBillingRecoveryRoutes(router.Group("/admin"), gateway)
+		for _, body := range []string{`{}`, `{"source":{"api_key_id":2}}`, string(valid)} {
+			response := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/admin/billing-recovery/imports/quote", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(response, req)
+			if body == string(valid) {
+				require.Equal(t, http.StatusServiceUnavailable, response.Code)
+			} else {
+				require.Equal(t, http.StatusBadRequest, response.Code)
+			}
+			require.Nil(t, store.input, "quotes must never reserve a source")
+		}
+	}
+}
+
 func TestBillingRecoveryHTTPDateFilterPreservesNanoseconds(t *testing.T) {
 	t.Setenv("BILLING_RECOVERY_ENABLED", "true")
 	store := &importHandlerStore{}
