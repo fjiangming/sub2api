@@ -29,6 +29,65 @@ func (s *importHandlerStore) List(ctx context.Context, _ string, _, _ int) ([]se
 	return []service.BillingRecoveryCase{}, 0, nil
 }
 
+type importGroupHandlerStore struct {
+	importHandlerStore
+	group *service.BillingRecoveryImportGroup
+}
+
+func (s *importGroupHandlerStore) ReserveImportGroup(_ context.Context, in *service.BillingRecoveryImportGroup, _ string) ([]service.BillingRecoveryImportClaim, error) {
+	s.group = in
+	return []service.BillingRecoveryImportClaim{{CaseID: "original-1"}, {CaseID: "original-2"}}, nil
+}
+
+func (s *importGroupHandlerStore) ImportClaims(_ context.Context, _ int64, from, to time.Time) ([]service.BillingRecoveryImportClaim, error) {
+	if !to.After(from) {
+		return nil, service.ErrBillingRecoveryConflict
+	}
+	return []service.BillingRecoveryImportClaim{{CaseID: "original-1"}}, nil
+}
+
+func TestBillingRecoveryImportGroupHTTPValidationAndUnavailableStore(t *testing.T) {
+	t.Setenv("BILLING_RECOVERY_ENABLED", "true")
+	t.Cleanup(func() { service.ConfigureBillingRecovery(nil) })
+	store := &importGroupHandlerStore{}
+	service.ConfigureBillingRecovery(store)
+	router := gin.New()
+	RegisterBillingRecoveryRoutes(router.Group("/admin"), nil)
+	in := service.BillingRecoveryImportGroup{Identity: strings.Repeat("a", 64), PayloadDigest: strings.Repeat("b", 64),
+		Members: make([]service.BillingRecoveryImportGroupMember, 2)}
+	valid, err := json.Marshal(in)
+	require.NoError(t, err)
+	for _, body := range []string{`{}`, strings.Replace(string(valid), strings.Repeat("a", 64), "invalid", 1), string(valid)} {
+		response := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/billing-recovery/imports/reserve-group", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(response, req)
+		if body == string(valid) {
+			require.Equal(t, 200, response.Code)
+			require.Equal(t, in.Identity, store.group.Identity)
+		} else {
+			require.Equal(t, 400, response.Code)
+			require.Nil(t, store.group)
+		}
+	}
+	for _, query := range []string{"account_id=bad", "account_id=3&from=invalid&to=invalid", "account_id=3&from=2026-10-22T00:00:00Z&to=2026-10-23T00:00:00Z"} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/billing-recovery/imports/claims?"+query, nil))
+		if strings.Contains(query, "2026-10-22") {
+			require.Equal(t, 200, response.Code)
+			require.Contains(t, response.Body.String(), "original-1")
+		} else {
+			require.Equal(t, 400, response.Code)
+		}
+	}
+	service.ConfigureBillingRecovery(&importHandlerStore{})
+	for _, route := range []struct{ method, path string }{{http.MethodPost, "/imports/reserve-group"}, {http.MethodGet, "/imports/claims"}} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(route.method, "/admin/billing-recovery"+route.path, nil))
+		require.Equal(t, http.StatusServiceUnavailable, response.Code)
+	}
+}
+
 func TestBillingRecoveryHTTPRegistrationWithoutGateway(t *testing.T) {
 	service.ConfigureBillingRecovery(nil)
 	t.Cleanup(func() { service.ConfigureBillingRecovery(nil) })

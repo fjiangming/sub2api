@@ -10,9 +10,10 @@ import (
 )
 
 type BillingRecoveryImportQuote struct {
-	Usage         *UsageLog `json:"usage_record"`
-	PricingSource string    `json:"pricing_source"`
-	PricingAt     time.Time `json:"pricing_at"`
+	Usage             *UsageLog `json:"usage_record"`
+	PricingSource     string    `json:"pricing_source"`
+	PricingAt         time.Time `json:"pricing_at"`
+	GroupAuditBlocked string    `json:"group_audit_blocked,omitempty"`
 }
 
 // A current quote is an explicit alternative for old requests without a price
@@ -38,6 +39,7 @@ func (s *GatewayService) QuoteBillingImportUsage(ctx context.Context, in *Billin
 		snapshot = make(map[string]json.RawMessage)
 	}
 	source := "immutable_dispatch_snapshot"
+	groupBlocked := ""
 	var quotedAt time.Time
 	if price := snapshot["pricing"]; len(price) > 0 && string(price) != "null" {
 		var plan recoveryPricePlan
@@ -52,6 +54,9 @@ func (s *GatewayService) QuoteBillingImportUsage(ctx context.Context, in *Billin
 		account, readErr := s.accountRepo.GetByID(ctx, entry.AccountID)
 		if readErr != nil {
 			return nil, readErr
+		}
+		if key.HasRateLimits() || account.HasAnyQuotaLimit() {
+			groupBlocked = "Key rolling limits or account quotas require exact historical request attribution"
 		}
 		pricingKey := *key
 		pricingKey.GroupID = entry.GroupID
@@ -100,5 +105,5 @@ func (s *GatewayService) QuoteBillingImportUsage(ctx context.Context, in *Billin
 		return nil, err
 	}
 	usage.ActualCost = QuantizeUsageBillingAmount(usage.TotalCost * usage.RateMultiplier)
-	return &BillingRecoveryImportQuote{Usage: usage, PricingSource: source, PricingAt: quotedAt}, nil
+	return &BillingRecoveryImportQuote{Usage: usage, PricingSource: source, PricingAt: quotedAt, GroupAuditBlocked: groupBlocked}, nil
 }

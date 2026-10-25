@@ -11,6 +11,62 @@ const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'backend/internal/repository/billing_recovery_settlement.go'), 'utf8');
 const queries = [...source.matchAll(/`([^`]+)`/g)].map((match) => match[1]);
 
+test('group reservation SQL freezes every claim in one transaction and rolls back the whole group on a late conflict', async () => {
+ const db = new PGlite();
+ try {
+  for (const name of ['custom_20261023_billing_recovery.sql', 'custom_20261023_billing_recovery_csv_import.sql', 'custom_20261025_billing_import_groups.sql']) {
+   const migration = fs.readFileSync(path.join(root, 'backend/migrations', name), 'utf8');
+   await db.exec(migration); await db.exec(migration);
+  }
+  await db.exec(`CREATE TABLE users(id bigint,email text,deleted_at timestamptz,balance numeric DEFAULT 100);
+   CREATE TABLE api_keys(id bigint,user_id bigint,name text,deleted_at timestamptz,rate_limit_5h numeric DEFAULT 0,rate_limit_1d numeric DEFAULT 0,rate_limit_7d numeric DEFAULT 0);
+   CREATE TABLE accounts(id bigint,name text,type text,rate_multiplier numeric,extra jsonb,deleted_at timestamptz);
+   CREATE TABLE usage_logs(user_id bigint,api_key_id bigint,account_id bigint,request_id text,upstream_request_id text);
+   INSERT INTO users(id,email) VALUES(1,'owner@example.test'); INSERT INTO api_keys(id,user_id,name) VALUES(2,1,'key');
+   INSERT INTO accounts VALUES(3,'supplier','apikey',0.79,'{}',NULL);`);
+  const sql = file => [...fs.readFileSync(path.join(root, file), 'utf8').matchAll(/`([^`]+)`/g)].map(match => match[1]);
+  const single = sql('backend/internal/repository/billing_recovery_import.go');
+  const group = sql('backend/internal/repository/billing_recovery_import_group.go');
+  const stage = single.find(query => query.includes("'user_email'"));
+  const claim = single.find(query => query.includes('INSERT INTO sub2api_custom.billing_import_claims'));
+  const freeze = group.find(query => query.includes("jsonb_build_object('csv_group_identity'"));
+  const receipt = group.find(query => query.includes('INSERT INTO sub2api_custom.billing_import_groups'));
+  const quotas = group.find(query => query.includes('SELECT COALESCE(k.rate_limit_5h'));
+  const list = group.find(query => query.includes('SELECT c.account_id,c.bill_identity'));
+  assert.ok(stage && claim && freeze && receipt && quotas && list);
+  const reserve = async (prefix, lastSource) => {
+   await db.exec('BEGIN');
+   try {
+    assert.equal(Object.values((await db.query(quotas,[2,3,1])).rows[0])[0],false);
+    for (let i = 0; i < 2; i++) {
+     const id = `${prefix}-${i}`;
+     await db.query(stage,[id,`historical-log:${prefix}-${i}`,1,2,3,7,null,'anthropic','/v1/messages','test','',
+      JSON.stringify({request_id:`${prefix}-${i}`}), 'administrator confirmed group','2026-10-22T01:00:00Z']);
+     await db.query(claim,[3,`${prefix}-bill-${i}`,i === 1 ? lastSource : `${prefix}-source-${i}`,'frozen',id,'admin']);
+     await db.query(freeze,[id,prefix,JSON.stringify({Model:'test',InputTokens:100+i,ActualCost:0.01})]);
+    }
+    await db.query(receipt,[3,prefix,'digest',JSON.stringify([{case_id:`${prefix}-0`},{case_id:`${prefix}-1`}])]);
+    await db.exec('COMMIT');
+   } catch (error) { await db.exec('ROLLBACK'); throw error; }
+  };
+  await reserve('original','shared-source');
+  await assert.rejects(reserve('conflicting','shared-source'),/duplicate key/);
+  assert.equal((await db.query('SELECT COUNT(*) FROM sub2api_custom.billing_import_claims')).rows[0].count,2);
+  assert.equal((await db.query('SELECT COUNT(*) FROM sub2api_custom.billing_recovery')).rows[0].count,2);
+  assert.equal((await db.query('SELECT COUNT(*) FROM sub2api_custom.billing_import_groups')).rows[0].count,1);
+  const frozen = (await db.query('SELECT request_snapshot FROM sub2api_custom.billing_recovery ORDER BY id')).rows;
+  assert.equal(frozen[1].request_snapshot.csv_group_usage.InputTokens,101);
+  assert.equal((await db.query('SELECT balance FROM users')).rows[0].balance,'100');
+  assert.equal((await db.query('SELECT COUNT(*) FROM usage_logs')).rows[0].count,0);
+  const historical = await db.query(list,[3,'2026-10-22T00:00:00Z','2026-10-23T00:00:00Z']);
+  assert.equal(historical.rows.length,2); assert.equal(historical.rows[0].state,'review');
+  assert.equal((await db.query(list,[3,'2026-10-23T00:00:00Z','2026-10-24T00:00:00Z'])).rows.length,0);
+  assert.equal((await db.query(list,[99,'2026-10-22T00:00:00Z','2026-10-23T00:00:00Z'])).rows.length,0);
+  await db.exec('UPDATE api_keys SET rate_limit_5h=10');
+  assert.equal(Object.values((await db.query(quotas,[2,3,1])).rows[0])[0],true);
+ } finally { await db.close(); }
+});
+
 test('dispatch snapshots and filtered timeout lookups retain exact users, accounts and response correlation', async () => {
  const db = new PGlite();
  try {

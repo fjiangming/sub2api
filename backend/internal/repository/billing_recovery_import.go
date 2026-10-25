@@ -19,14 +19,37 @@ import (
 var billingImportDigest = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 func (r *billingRecoveryRepository) ReserveImport(ctx context.Context, in *service.BillingRecoveryImport, actor string) (string, error) {
+	if !validBillingImport(in) {
+		return "", service.ErrBillingRecoveryConflict
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, fmt.Sprintf("billing-import:%d", in.AccountID)); err != nil {
+		return "", err
+	}
+	id, err := r.reserveImport(ctx, tx, in, actor)
+	if err != nil {
+		return "", err
+	}
+	return id, tx.Commit()
+}
+
+func validBillingImport(in *service.BillingRecoveryImport) bool {
 	if in == nil || in.AccountID <= 0 || in.UserID <= 0 || in.APIKeyID <= 0 ||
 		!billingImportDigest.MatchString(in.BillIdentity) || !billingImportDigest.MatchString(in.PayloadDigest) ||
 		strings.TrimSpace(in.Model) == "" || utf8.RuneCountInString(in.Model) > 128 || utf8.RuneCountInString(in.UpstreamID) > 128 ||
 		utf8.RuneCountInString(in.Evidence) < 8 || utf8.RuneCountInString(in.Evidence) > 4000 ||
 		!validImportSource(in) ||
 		in.StartedAt.IsZero() || time.Since(in.StartedAt) < service.BillingRecoveryTimeout()+time.Minute {
-		return "", service.ErrBillingRecoveryConflict
+		return false
 	}
+	return true
+}
+
+func importLocalReference(in *service.BillingRecoveryImport) string {
 	local := "case:" + in.CaseID
 	if in.CaseID == "" {
 		local = fmt.Sprintf("error:%d:%d", in.ErrorID, in.EventIndex)
@@ -34,25 +57,22 @@ func (r *billingRecoveryRepository) ReserveImport(ctx context.Context, in *servi
 			local = "log:" + in.LogSource.RequestID
 		}
 	}
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = tx.Rollback() }()
-	// Serialize claims for an account, including claims through different exports.
-	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, fmt.Sprintf("billing-import:%d", in.AccountID)); err != nil {
-		return "", err
-	}
+	return local
+}
+
+// The caller holds the account lock. Groups reuse this path in one transaction.
+func (r *billingRecoveryRepository) reserveImport(ctx context.Context, tx *sql.Tx, in *service.BillingRecoveryImport, actor string) (string, error) {
+	local := importLocalReference(in)
 	var id, bill, digest, reference string
 	var account int64
-	err = tx.QueryRowContext(ctx, `SELECT case_id,account_id,bill_identity,payload_digest,local_reference
+	err := tx.QueryRowContext(ctx, `SELECT case_id,account_id,bill_identity,payload_digest,local_reference
       FROM sub2api_custom.billing_import_claims WHERE (account_id=$1 AND bill_identity=$2) OR local_reference=$3`,
 		in.AccountID, in.BillIdentity, local).Scan(&id, &account, &bill, &digest, &reference)
 	if err == nil {
 		if account != in.AccountID || bill != in.BillIdentity || digest != in.PayloadDigest || reference != local {
 			return "", service.ErrBillingRecoveryConflict
 		}
-		return id, tx.Commit()
+		return id, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
@@ -82,7 +102,7 @@ func (r *billingRecoveryRepository) ReserveImport(ctx context.Context, in *servi
       VALUES($1,'csv_import_reserved',$2,$3)`, id, actor, in.Evidence); err != nil {
 		return "", err
 	}
-	return id, tx.Commit()
+	return id, nil
 }
 
 func (r *billingRecoveryRepository) stageHistoricalError(ctx context.Context, tx *sql.Tx, in *service.BillingRecoveryImport) (string, error) {

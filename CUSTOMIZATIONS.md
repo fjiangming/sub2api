@@ -263,3 +263,29 @@ Windows service 全包测试仍只有此前台账记录的 `TestCommandCodeGatew
 验证：service / repository / handler / routes 的 BillingRecovery、UsageBilling、RecordUsage 专项通过（routes 无命中用例）；新报价接口及 Key 迁组回归另行通过。4 项真实 PostgreSQL/PGlite 回归、Windows server 构建通过。golangci-lint 2.14.0 以原 CI 默认配置检查三个完整包，结果 0 issues；额外启用 unit 标签的 lint 曾暴露原生未改动测试文件中的依赖 / 返回值 / staticcheck 等告警，未因此改动它们，本轮新增报价文件的一处无效赋值已修复并复测。不能将这些结果表述为 Linux 全量测试或所有标签 lint 均通过。配套运营中心 225 项全量测试、check、四组桌面 / 手机模拟流程及离线回放通过，详细数量见 extra 台账；两仓库 diff --check 通过。尚未进行实际服务器定价读取、真实资金结算、Docker / Linux CI 或 GitHub 发布，新增与修改文件均保留本地供后续审核。
 
 用户随后授权验证后推送 GitHub。提交本节的 CSV 自动报价、完整日志来源及配套测试 / 台账到 dev，extra 配套提交到 main；沿用现有 CI / Security 门禁及 fork Release / GHCR 通道，不修改发行配置。推送前 fetch 确认两仓库均与目标分支同步，复核改动及验证记录。此前独立的生产镜像通道维护台账和服务器改动清单继续保留本地未提交，不纳入本次功能提交；不部署服务器或操作真实资金。推送成功只代表代码已上传，构建 / 发布结果以本次完整 SHA 的 Actions 为准。
+
+## 2026-10-25：CSV 整组核查的原子认领和历史防重接口
+
+用户要求实现自动候选核查和去重。本轮主站保持 `dev`，编排 / 匹配 / 界面仍在 extra 的 `operations-center`；仅本地代码和隔离测试，不提交、推送、发布、部署、连接生产或补扣真实用户。保留此前独立生产镜像通道台账及 `docs/server-changes-2026-10-23.md` 的既有未提交改动。原 fork Release / GHCR 通道不变。
+
+| 文件 | 本轮增量与后续集成须保留的约定 |
+| --- | --- |
+| `backend/internal/service/billing_recovery_import_group.go`（新增） | 可选整组 store / DTO 和历史认领 DTO，不扩大原通用恢复接口；2–20 成员，冻结原生使用记录全部计费维度，Restore 仅允许改变原生生成的 ID / 请求 ID / 入账时间及加载关系。不把稳定记账分配称为历史逐笔确定关联。 |
+| `backend/internal/repository/billing_recovery_import_group.go`（新增） | 复用按上游账号的事务 advisory lock，先检查所有历史来源，再在同一事务中认领所有账单 / 来源、冻结 usage 并保存原组回执。任一冲突全组回滚；同组同摘要重试返回原案件，不重新分配。只允许相同用户 / Key / 分组 / 账号的余额历史来源，无持久 CaseID；配置 Key 滚动限额或账号配额则阻断。新 ImportClaims 按账号及 CSV 历史请求时间返回认领与实时案件状态，最长 34 天 / 20,000 条，超限失败，不能返回部分结果冒充完整防重。 |
+| `backend/internal/repository/billing_recovery_import.go` | 提取输入验证、稳定本地引用及事务内 reserveImport，单条 API 保持原有行为；组复用相同的历史来源检查、双唯一约束、原生用量 / 持久意图 / dedup 热表和归档保护。多种来源描述同一请求时，后续 staging 检查可阻断并回滚，不允许按别名重复计费。 |
+| `backend/migrations/custom_20261025_billing_import_groups.sql`（新增） | 只新增 `sub2api_custom.billing_import_groups`，按账号 + 组身份唯一，保存摘要和原案件回执；不改写已执行迁移，不新增余额或资金表。必须随主站升级应用，不能仅升级运营中心。 |
+| `backend/internal/handler/billing_recovery_handler.go` | 在原管理员边界内新增 POST `/api/v1/admin/billing-recovery/imports/reserve-group`、GET `/api/v1/admin/billing-recovery/imports/claims`；验证输入，缺可选 store 返回 503。仅认领，不创建 usage_logs 或扣费。 |
+| `backend/internal/service/billing_recovery_import_quote.go` | 原只读报价附加可选 group_audit_blocked，Key 滚动限额 / 账号配额不满足组内时间分配等价时解释阻断；普通单条报价和历史快照 / 当前价语义不变。 |
+| `backend/internal/service/billing_recovery_usage.go` | 原 Restore 流程校验整组冻结用量与金额，并拒绝认领后新启用的 Key 滚动限额 / 账号配额；不修改原生 Apply、订阅或差额资金事务。仍先保存核定使用记录，再 review → prepared → settle。 |
+| `backend/internal/repository/billing_recovery_import_group_test.go`、`backend/internal/service/billing_recovery_import_group_test.go`（新增） | 整组全成 / 全回滚、原回执幂等、摘要冲突、重复账单 / 来源、归属 / 订阅 / 金额 / 人数边界、原生重复踪迹与配额阻断，所有用量 / 价格维度冻结、非法冻结快照及认领后改限额的回归。 |
+| `backend/internal/handler/billing_recovery_handler_test.go` | 新接口输入校验、可选 store 缺失及按历史时间读取认领的回归。 |
+| `.github/billing-recovery-sql.test.cjs` | 执行实际新迁移和仓库 SQL，验证末成员唯一冲突使全部新案件 / 认领回滚、冻结用量、历史时间 / 账号过滤及 Key 限额阻断；认领期间 usage 和余额均不变。保留原 4 项 PostgreSQL 回归。 |
+| `CUSTOMIZATIONS.md` | 记录本轮所有核心改动。完整操作和 extra 约束见配套 `operations-center/docs/billing-csv-import.md`。 |
+
+主站只负责原子认领、不可变金额和原生计费，整组覆盖 / 可能对应方式报价等价的证明在运营中心。完整日志仍是受管理员认证保护的来源声明，核心不认证原文件；管理员须核对最终 CSV 和归属。历史报价没有快照时明确使用当前主站价，不将采购支出换算为用户售价。
+
+整组认领是原子的，逐笔资金结算不是全组同一事务；部分成功后必须沿原组 / 原案件恢复，已经结算的成员保持幂等。无法证明完整覆盖、仍有组外缺耗时请求、订阅、滚动额度、跨用户或历史关联缺失都继续待核查，不能为了增加可补记条数放宽。历史快照回放未新增可补记组，不代表实现失效或已经确认了全部亏损。
+
+验证：BillingRecovery / UsageBilling 的 repository / service / handler 专项，以及最终冻结快照 / 新 HTTP 接口专项通过；5 项实际 PostgreSQL/PGlite 迁移和 SQL 回归通过。以原 CI 默认配置运行 golangci-lint 2.14.0 检查上述三个完整包为 0 issues，最终 Windows server 构建和两仓库 diff --check 通过。配套运营中心完整 252 项测试、npm run check、六组桌面 / 手机 Playwright 模拟和两种离线回放通过；回放保护结果见 extra 同日台账。未运行 Docker / Linux 全量 CI、生产原生报价或实际扣费，本地演示只有模拟数据。新增源文件和迁移仍未提交或推送。
+
+用户随后明确授权提交并推送 GitHub。本轮将整组认领、历史防重接口、迁移和回归提交到主站 dev，配套匹配版本 4 / 5 / 6 与运营编排提交到 extra main。推送前 fetch 确认两仓库均与远端同分支同步；独立生产镜像通道台账、服务器维护清单和其他项目文件继续保留本地。沿用现有 CI / Security 和镜像发布流程，构建与发布结果以此次提交 SHA 的 Actions 为准；本次不部署服务器或操作真实资金。完整功能升级需主站和运营中心同时更新。

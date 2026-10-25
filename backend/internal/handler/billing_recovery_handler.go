@@ -88,6 +88,52 @@ func RegisterBillingRecoveryRoutes(admin *gin.RouterGroup, h *GatewayHandler) {
 		}
 		response.Success(c, gin.H{"case_id": id})
 	})
+	group.POST("/imports/reserve-group", func(c *gin.Context) {
+		s := store(c)
+		if s == nil {
+			return
+		}
+		imports, ok := s.(service.BillingRecoveryImportGroupStore)
+		if !ok {
+			response.Error(c, http.StatusServiceUnavailable, "Group import is unavailable")
+			return
+		}
+		var input service.BillingRecoveryImportGroup
+		if err := c.ShouldBindJSON(&input); err != nil {
+			response.BadRequest(c, "A complete frozen group is required")
+			return
+		}
+		receipt, err := imports.ReserveImportGroup(c.Request.Context(), &input, actor(c))
+		if err != nil {
+			respondError(c, err)
+			return
+		}
+		response.Success(c, gin.H{"claims": receipt})
+	})
+	group.GET("/imports/claims", func(c *gin.Context) {
+		s := store(c)
+		if s == nil {
+			return
+		}
+		imports, ok := s.(service.BillingRecoveryImportGroupStore)
+		if !ok {
+			response.Error(c, http.StatusServiceUnavailable, "Import claims are unavailable")
+			return
+		}
+		account, err := strconv.ParseInt(c.Query("account_id"), 10, 64)
+		from, fromErr := time.Parse(time.RFC3339Nano, c.Query("from"))
+		to, toErr := time.Parse(time.RFC3339Nano, c.Query("to"))
+		if err != nil || account <= 0 || fromErr != nil || toErr != nil {
+			response.BadRequest(c, "Account and evidence window are required")
+			return
+		}
+		claims, err := imports.ImportClaims(c.Request.Context(), account, from, to)
+		if err != nil {
+			respondError(c, err)
+			return
+		}
+		response.Success(c, gin.H{"claims": claims})
+	})
 	group.GET("", func(c *gin.Context) {
 		s := store(c)
 		if s == nil {

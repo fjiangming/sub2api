@@ -105,6 +105,18 @@ func (s *GatewayService) RestoreBillingRecoveryUsage(ctx context.Context, id str
 		return "", fmt.Errorf("invalid account multiplier")
 	}
 	u.AccountRateMultiplier = &multiplier
+	if entry.State != "settled" {
+		if err = verifyFrozenImportGroupUsage(entry, u); err != nil {
+			return "", err
+		}
+		var group struct {
+			Identity string `json:"csv_group_identity"`
+		}
+		_ = json.Unmarshal(entry.Snapshot, &group)
+		if group.Identity != "" && (key.HasRateLimits() || account.HasAnyQuotaLimit()) {
+			return "", ErrBillingRecoveryConflict
+		}
+	}
 	cmd := buildUsageBillingCommand(u.RequestID, u, &postUsageBillingParams{User: key.User, APIKey: key, Account: account, Subscription: subscription, IsSubscriptionBill: subscription != nil, AccountRateMultiplier: multiplier, Cost: &CostBreakdown{TotalCost: u.TotalCost, ActualCost: u.ActualCost}})
 	if cmd == nil {
 		return "", fmt.Errorf("unable to prepare usage settlement")
