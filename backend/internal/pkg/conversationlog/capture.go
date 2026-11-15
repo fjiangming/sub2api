@@ -106,7 +106,7 @@ func current() *collector {
 		}
 		ip := net.ParseIP(u.Hostname())
 		local := u.Hostname() == "localhost" || (ip == nil && !strings.ContainsAny(u.Hostname(), ".:")) || (ip != nil && (ip.IsLoopback() || ip.IsPrivate()))
-		if u.Scheme != "https" && !(u.Scheme == "http" && local) {
+		if u.Scheme != "https" && (u.Scheme != "http" || !local) {
 			return
 		}
 		global = newCollector(base, token)

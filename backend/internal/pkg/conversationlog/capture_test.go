@@ -218,7 +218,10 @@ func TestSendingRechecksExclusionAndNeverSpools(t *testing.T) {
 
 func TestCapturePressureDiscardsBodiesAndReleasesTheAttemptBudget(t *testing.T) {
 	c, _, _ := fixture(t, policy{Version: 1, Enabled: true, Limit: 65536})
-	s := bind(context.Background(), c, 1, 2, "").Value(scopeKey).(*scope)
+	s, ok := bind(context.Background(), c, 1, 2, "").Value(scopeKey).(*scope)
+	if !ok {
+		t.Fatal("capture scope was not bound")
+	}
 	a := s.begin(3, "upstream.example", "/v1/responses", "POST", "JSON")
 	c.used.Store(64 * 1024 * 1024)
 	a.append("request", []byte("secret"), nil)

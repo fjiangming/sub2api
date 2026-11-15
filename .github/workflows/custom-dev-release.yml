@@ -37,6 +37,12 @@ jobs:
         with:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
+      - name: Backend lint before publication
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+          args: --timeout=30m
+          working-directory: backend
       - name: Backend unit and capture race tests
         working-directory: backend
         run: |
