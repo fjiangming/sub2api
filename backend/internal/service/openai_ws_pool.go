@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/conversationlog"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -94,6 +95,7 @@ type openAIWSHandshakeCompatibilityKey struct {
 }
 
 type openAIWSConnLease struct {
+	archiveCtx context.Context
 	pool       *openAIWSConnPool
 	accountID  int64
 	conn       *openAIWSConn
@@ -199,7 +201,7 @@ func (l *openAIWSConnLease) WriteJSON(value any, timeout time.Duration) error {
 	if err != nil {
 		return err
 	}
-	return conn.writeJSONWithTimeout(context.Background(), value, timeout)
+	return conn.writeJSONWithTimeout(conversationlog.CaptureContext(context.Background(), l.archiveCtx, l.accountID), value, timeout)
 }
 
 func (l *openAIWSConnLease) WriteJSONWithContextTimeout(ctx context.Context, value any, timeout time.Duration) error {
@@ -207,7 +209,7 @@ func (l *openAIWSConnLease) WriteJSONWithContextTimeout(ctx context.Context, val
 	if err != nil {
 		return err
 	}
-	return conn.writeJSONWithTimeout(ctx, value, timeout)
+	return conn.writeJSONWithTimeout(conversationlog.CaptureContext(ctx, l.archiveCtx, l.accountID), value, timeout)
 }
 
 func (l *openAIWSConnLease) WriteJSONContext(ctx context.Context, value any) error {
@@ -215,7 +217,7 @@ func (l *openAIWSConnLease) WriteJSONContext(ctx context.Context, value any) err
 	if err != nil {
 		return err
 	}
-	return conn.writeJSON(value, ctx)
+	return conn.writeJSON(value, conversationlog.CaptureContext(ctx, l.archiveCtx, l.accountID))
 }
 
 func (l *openAIWSConnLease) ReadMessage(timeout time.Duration) ([]byte, error) {
@@ -223,7 +225,11 @@ func (l *openAIWSConnLease) ReadMessage(timeout time.Duration) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return conn.readMessageWithTimeout(timeout)
+	payload, readErr := conn.readMessageWithTimeout(timeout)
+	if readErr == nil && l.archiveCtx != nil {
+		conversationlog.RecordFrame(l.archiveCtx, l.accountID, "in", payload, false)
+	}
+	return payload, readErr
 }
 
 func (l *openAIWSConnLease) ReadMessageContext(ctx context.Context) ([]byte, error) {
@@ -231,7 +237,11 @@ func (l *openAIWSConnLease) ReadMessageContext(ctx context.Context) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
-	return conn.readMessage(ctx)
+	payload, readErr := conn.readMessage(ctx)
+	if readErr == nil && l.archiveCtx != nil {
+		conversationlog.RecordFrame(l.archiveCtx, l.accountID, "in", payload, false)
+	}
+	return payload, readErr
 }
 
 func (l *openAIWSConnLease) ReadMessageWithContextTimeout(ctx context.Context, timeout time.Duration) ([]byte, error) {
@@ -239,7 +249,11 @@ func (l *openAIWSConnLease) ReadMessageWithContextTimeout(ctx context.Context, t
 	if err != nil {
 		return nil, err
 	}
-	return conn.readMessageWithContextTimeout(ctx, timeout)
+	payload, readErr := conn.readMessageWithContextTimeout(ctx, timeout)
+	if readErr == nil && l.archiveCtx != nil {
+		conversationlog.RecordFrame(l.archiveCtx, l.accountID, "in", payload, false)
+	}
+	return payload, readErr
 }
 
 func (l *openAIWSConnLease) PingWithTimeout(timeout time.Duration) error {
@@ -1131,6 +1145,7 @@ func (p *openAIWSConnPool) Acquire(ctx context.Context, req openAIWSAcquireReque
 		p.metrics.acquireQueueWaitMs.Add(queueWait.total.Milliseconds())
 	}
 	if lease != nil && lease.conn != nil {
+		lease.archiveCtx = ctx
 		now := time.Now()
 		lease.idleBefore = lease.conn.idleDuration(now)
 		lease.ageBefore = lease.conn.age(now)

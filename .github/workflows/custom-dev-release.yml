@@ -1,0 +1,214 @@
+name: Fork Dev Release
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    if: github.repository == 'fjiangming/sub2api' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=. read -r major minor patch < backend/cmd/server/VERSION
+          patch=${patch%%-*}
+          [[ "$major.$minor.$patch" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version="$major.$minor.$((10#$patch * 1000000 + GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Backend unit and capture race tests
+        working-directory: backend
+        run: |
+          go test -tags=unit ./...
+          go test -race ./internal/pkg/conversationlog
+
+  frontend:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: frontend
+      - run: pnpm run build
+        working-directory: frontend
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dev-frontend
+          path: backend/internal/web/dist/
+          if-no-files-found: error
+          retention-days: 3
+
+  binaries:
+    needs: [version, frontend]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: dev-frontend
+          path: backend/internal/web/dist/
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Build immutable updater archive
+        env:
+          DEV_VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "$DEV_VERSION" > backend/cmd/server/VERSION
+          os=${TARGET%/*}; arch=${TARGET#*/}; binary=sub2api
+          [ "$os" != windows ] || binary=sub2api.exe
+          stage=$(mktemp -d)
+          (cd backend && CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -tags=embed -trimpath \
+            -ldflags "-s -w -X main.Commit=$GITHUB_SHA -X main.Date=$(date -u +%FT%TZ) -X main.BuildType=release" \
+            -o "$stage/$binary" ./cmd/server)
+          mkdir -p release-assets
+          archive="sub2api_${DEV_VERSION}_${os}_${arch}"
+          if [ "$os" = windows ]; then
+            (cd "$stage" && zip "$GITHUB_WORKSPACE/release-assets/$archive.zip" "$binary")
+          else
+            tar -czf "release-assets/$archive.tar.gz" -C "$stage" "$binary"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dev-binary-${{ strategy.job-index }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 7
+
+  images:
+    needs: [version, binaries, checks]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      packages: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dev-binary-*
+          path: release-assets/
+          merge-multiple: true
+      - name: Prepare native image context
+        env:
+          DEV_VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p "fork-image/$ARCH"
+          tar -xzf "release-assets/sub2api_${DEV_VERSION}_linux_${ARCH}.tar.gz" -C "fork-image/$ARCH"
+          cp -r backend/resources fork-image/resources
+          cp deploy/docker-entrypoint.sh fork-image/docker-entrypoint.sh
+          cp Dockerfile.custom-release fork-image/Dockerfile
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        id: image
+        with:
+          context: fork-image
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ghcr.io/fjiangming/sub2api:${{ needs.version.outputs.version }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/fjiangming/sub2api
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Verify the native runtime before release
+        env:
+          IMAGE: ghcr.io/fjiangming/sub2api@${{ steps.image.outputs.digest }}
+          DEV_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE"
+          output=$(docker run --rm --entrypoint /app/sub2api "$IMAGE" -version 2>&1)
+          [[ "$output" == *"Sub2API $DEV_VERSION (commit: $GITHUB_SHA,"* ]]
+          docker run --rm --entrypoint /usr/local/bin/pg_dump "$IMAGE" --version
+          docker run --rm --entrypoint /usr/local/bin/psql "$IMAGE" --version
+
+  publish:
+    needs: [version, images, checks]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fork-dev-release-promotion
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dev-binary-*
+          path: release-assets/
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish versioned images and update assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEV_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          image=ghcr.io/fjiangming/sub2api
+          docker buildx imagetools create --tag "$image:$DEV_VERSION" "$image:$DEV_VERSION-amd64" "$image:$DEV_VERSION-arm64"
+          (cd release-assets && sha256sum sub2api_* > checksums.txt)
+          tag="v$DEV_VERSION"
+          remote_sha=$(git ls-remote --refs origin "refs/tags/$tag" | awk '{print $1}')
+          if [ -n "$remote_sha" ]; then [[ "$remote_sha" = "$GITHUB_SHA" ]]; else git tag "$tag" "$GITHUB_SHA"; git push origin "refs/tags/$tag"; fi
+          gh release create "$tag" release-assets/* --verify-tag --repo "$GITHUB_REPOSITORY" \
+            --title "Sub2API $DEV_VERSION (dev)" --notes "Built from dev commit $GITHUB_SHA. Includes upstream conversation capture; collection remains disabled until configured." --latest=false
+          highest=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' | sort -V | tail -1)
+          if [ "$highest" = "$tag" ]; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --latest
+            docker buildx imagetools create --tag "$image:dev" --tag "$image:latest" "$image:$DEV_VERSION"
+          fi

@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -28,13 +29,34 @@ func (s *updateServiceCacheStub) SetUpdateInfo(_ context.Context, data string, _
 }
 
 type updateServiceGitHubClientStub struct {
+	lastRepo       string
 	release        *GitHubRelease
 	recentReleases []*GitHubRelease
 	recentErr      error
 }
 
-func (s *updateServiceGitHubClientStub) FetchLatestRelease(context.Context, string) (*GitHubRelease, error) {
+func (s *updateServiceGitHubClientStub) FetchLatestRelease(_ context.Context, repo string) (*GitHubRelease, error) {
+	s.lastRepo = repo
 	return s.release, nil
+}
+
+func TestUpdateServiceRejectsUpstreamCacheAndUsesForkSource(t *testing.T) {
+	for _, source := range []string{"", "Wei-Shaw/sub2api"} {
+		cached, err := json.Marshal(map[string]any{"source": source, "latest": "99.0.0", "timestamp": time.Now().Unix()})
+		require.NoError(t, err)
+		cache := &updateServiceCacheStub{data: string(cached)}
+		client := &updateServiceGitHubClientStub{release: &GitHubRelease{TagName: "v0.2.21000101"}}
+		svc := NewUpdateService(cache, client, "0.2.21", "release")
+		info, err := svc.CheckUpdate(context.Background(), false)
+		require.NoError(t, err)
+		require.Equal(t, "fjiangming/sub2api", client.lastRepo)
+		require.Equal(t, "0.2.21000101", info.LatestVersion)
+		require.True(t, info.HasUpdate)
+		require.Contains(t, cache.data, `"source":"fjiangming/sub2api"`)
+		info, err = svc.CheckUpdate(context.Background(), false)
+		require.NoError(t, err)
+		require.True(t, info.Cached)
+	}
 }
 
 func (s *updateServiceGitHubClientStub) FetchRecentReleases(context.Context, string, int) ([]*GitHubRelease, error) {

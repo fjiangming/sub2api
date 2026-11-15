@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/conversationlog"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -138,7 +139,10 @@ func (s *OpenAIGatewayService) ProxyGrokRealtime(ctx context.Context, c *gin.Con
 	return s.ProxyGrokRealtimeConn(ctx, c, client, upstream)
 }
 
-type GrokRealtimeUpstream struct{ conn openAIWSClientConn }
+type GrokRealtimeUpstream struct {
+	conn      openAIWSClientConn
+	accountID int64
+}
 
 // GrokRealtimeDialError preserves an HTTP status returned before WebSocket
 // upgrade so handlers can apply the normal Grok account policy.
@@ -186,7 +190,7 @@ func (s *OpenAIGatewayService) OpenGrokRealtime(ctx context.Context, account *Ac
 	if err != nil {
 		return nil, &GrokRealtimeDialError{StatusCode: status, Err: err}
 	}
-	return &GrokRealtimeUpstream{conn: conn}, nil
+	return &GrokRealtimeUpstream{conn: conn, accountID: account.ID}, nil
 }
 
 // HandleGrokRealtimeUpstreamError applies the shared Grok account policy to a
@@ -204,7 +208,7 @@ func (s *OpenAIGatewayService) ProxyGrokRealtimeConn(ctx context.Context, c *gin
 	}
 	conn := upstream.conn
 
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(conversationlog.WithAccount(ctx, upstream.accountID))
 	defer cancel()
 	errCh := make(chan error, 2)
 	var audioObserved atomic.Bool
@@ -217,6 +221,7 @@ func (s *OpenAIGatewayService) ProxyGrokRealtimeConn(ctx context.Context, c *gin
 				errCh <- readErr
 				return
 			}
+			conversationlog.RecordFrame(ctx, upstream.accountID, "in", msg, false)
 			if grokRealtimeEventHasAudio(msg) {
 				audioObserved.Store(true)
 			}

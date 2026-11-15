@@ -1,0 +1,19 @@
+# Fork Customizations
+
+## 2026-11-16: Conversation archive and dev distribution
+
+User authorized recreating local dev from the replacement origin/dev, implementing the approved operations-center conversation archive and publishing dev packages. Server configuration and deployment remain pending user confirmation.
+
+Base: 530c5e3a4f9c73ca2b0881191d0ef8e0d82c5484, identical to origin/main at refresh. Previous dev and its unrelated uncommitted ledger/server documentation remain in the original checkout on codex/dev-before-refresh-20261115. No previous billing customization is silently reintroduced onto the fresh base.
+
+Implementation and verification are recorded below as work proceeds.
+
+- `backend/internal/pkg/conversationlog/{capture.go,capture_test.go}`: opt-in authenticated user/key scopes, per-RoundTrip raw byte tee, original encoding, attempt association, bounded memory/queue, policy fail-closed gates, asynchronous delivery without a raw disk spool, WS message segments and per-lease identity. Loopback tests verify byte spelling, gzip SSE, early close, limits, policy failure, exclusion recheck, context semantics and user/key isolation.
+- `backend/internal/repository/http_upstream.go`: observe the real transport, including TLS fingerprints and Grok fallback attempts; attach trusted selected account ID. Original inference retries, compression negotiation, cancellation and billing remain native.
+- `backend/internal/server/middleware/{api_key_auth.go,api_key_auth_google.go}`: bind authenticated IDs and finish WS scopes; never trust client body user fields.
+- `backend/internal/service/{conversation_logging.go,openai_ws_client.go,openai_ws_pool.go,openai_ws_v2_passthrough_adapter.go,grok_audio.go}`: capture the bytes actually written/read at lease/relay boundaries, preserving the original JSON encoder, cancellation/deadline behavior and frame sequence. No capture by pooled background readers.
+- `backend/internal/service/{update_service.go,update_service_test.go}`, `frontend/src/components/common/VersionBadge.vue`, `deploy/install.sh`: fork release/image sources and repository-bound update cache; no reuse of old upstream cache. Tests and final verification to follow.
+- `.github/workflows/custom-dev-release.yml`, `Dockerfile.custom-release`, `.github/release-tools/fork_dev_status.cjs`: automatic dev unit/race checks, frontend embed, five-platform archives/checksums, native amd64/arm64 image runtime checks, immutable source release and serialized promotion of the highest successful version. Status helper uses existing credentials only in memory and prints no job logs or secrets. It does not deploy.
+- `CONVERSATION_LOGS.md`: opt-in environment variables and archive/compatibility boundaries. Full operator instructions live in the companion operations-center module.
+
+Local verification: six capture tests, updater source/cache tests, production frontend build and Linux amd64 embedded binary build passed. Repository and middleware unit suites passed after adding the installed Git shell to PATH. The service suite has two existing Windows clock-resolution failures in catalog-cache uniqueness and Ollama callback CAS (both rely on distinct consecutive time.Now values); neither uses this collector. Native baseline CI at 530c5e3a passed on Linux; the Linux full unit/race release gate remains enabled. The baseline Security Scan already fails govulncheck before these changes; it is not disabled or rewritten. Companion operations-center passed 400 tests, then 13 focused archive tests after one additional case, all syntax checks and two rounds of four viewport/preference browser checks. YAML and diff checks passed. Publication results will be recorded after completion.

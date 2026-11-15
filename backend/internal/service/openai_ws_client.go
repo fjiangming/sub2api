@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/conversationlog"
 	openaiwsv2 "github.com/Wei-Shaw/sub2api/internal/service/openai_ws_v2"
 	coderws "github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -309,7 +311,26 @@ func (c *coderOpenAIWSClientConn) WriteJSON(ctx context.Context, value any) erro
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return wsjson.Write(ctx, c.conn, value)
+	if !conversationlog.Enabled(ctx) {
+		return wsjson.Write(ctx, c.conn, value)
+	}
+	if err := json.NewEncoder(conversationWSWriter{ctx: ctx, conn: c.conn}).Encode(value); err != nil {
+		return fmt.Errorf("failed to write JSON message: failed to marshal JSON: %w", err)
+	}
+	return nil
+}
+
+type conversationWSWriter struct {
+	ctx  context.Context
+	conn *coderws.Conn
+}
+
+func (w conversationWSWriter) Write(data []byte) (int, error) {
+	if err := w.conn.Write(w.ctx, coderws.MessageText, data); err != nil {
+		return 0, err
+	}
+	conversationlog.RecordFrame(w.ctx, conversationlog.Account(w.ctx), "out", data, false)
+	return len(data), nil
 }
 
 func (c *coderOpenAIWSClientConn) ReadMessage(ctx context.Context) ([]byte, error) {
