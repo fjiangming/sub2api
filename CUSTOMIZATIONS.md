@@ -1,5 +1,15 @@
 # Fork Customizations
 
+## 2026-11-16: Retain bounded conversation capture on overflow
+
+User requested better conversation archive compatibility, preserving source on processing errors and one-click reprocessing in the companion operations center. Source inspection also confirmed that bounds previously erased all captured request/response bytes.
+
+- `backend/internal/pkg/conversationlog/capture.go`: retain exact HTTP prefixes up to the existing aggregate attempt limit; retain prior reserved bytes on memory pressure and prior complete WebSocket messages on bounds. Keep incomplete reasons, exclusions before collection/send, the 64 MiB global budget, 32-item queue, deadlines, normal inference/cancellation and billing unchanged. Queue failure and cleanup still release the budget.
+- `backend/internal/pkg/conversationlog/capture_test.go`: assert exact bounded prefixes, partial-frame preservation and retained-byte budget release; keep exclusion, early-close, identity and queue tests.
+- `CONVERSATION_LOGS.md`: explain aggregate limits, partial retention and the companion encrypted error fallback / retry. No lossless audit guarantee or historical-body recovery is claimed.
+
+Local verification: all seven collector tests passed. The Windows environment has no C compiler, so race verification remains mandatory in the existing Linux publication gate. Companion operations center passed all 412 tests, syntax checks and four viewport/preference browser flows, including encrypted fallback and atomic retry with late-response isolation. Publication and deployment results will be recorded after completion.
+
 ## 2026-11-16: Conversation archive and dev distribution
 
 User authorized recreating local dev from the replacement origin/dev, implementing the approved operations-center conversation archive and publishing dev packages. Server configuration and deployment remain pending user confirmation.

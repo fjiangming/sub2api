@@ -242,14 +242,12 @@ func (a *attempt) reserveLocked(n int) bool {
 	}
 	if a.used+int64(n) > int64(a.limit) {
 		a.row.Reason = "body_limit"
-		a.clearLocked()
 		return false
 	}
 	for {
 		used := a.client.used.Load()
 		if used+int64(n) > 64*1024*1024 {
 			a.row.Reason = "memory_limit"
-			a.clearLocked()
 			return false
 		}
 		if a.client.used.CompareAndSwap(used, used+int64(n)) {
@@ -278,12 +276,17 @@ func (a *attempt) append(side string, data []byte, err error) {
 	if err != nil && err != io.EOF && a.row.Reason == "" {
 		a.row.Reason = "read_error"
 	}
-	if len(data) > 0 && a.reserveLocked(len(data)) {
+	// Keep the observed prefix on overflow; the gateway still consumes the original stream unchanged.
+	size := min(len(data), max(0, a.limit-int(a.used)))
+	if size > 0 && a.reserveLocked(size) {
 		if side == "request" {
-			a.row.Request = append(a.row.Request, data...)
+			a.row.Request = append(a.row.Request, data[:size]...)
 		} else {
-			a.row.Response = append(a.row.Response, data...)
+			a.row.Response = append(a.row.Response, data[:size]...)
 		}
+	}
+	if len(data) > size && a.row.Reason != "memory_limit" {
+		a.row.Reason = "body_limit"
 	}
 }
 func (a *attempt) finish(complete bool, reason string) {
@@ -458,7 +461,6 @@ func RecordFrame(ctx context.Context, account int64, direction string, body []by
 	a.mu.Lock()
 	if len(a.row.Frames) >= 10000 {
 		a.row.Reason = "body_limit"
-		a.clearLocked()
 	}
 	if a.reserveLocked(len(body)) {
 		data := append([]byte{}, body...)

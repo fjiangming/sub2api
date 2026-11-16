@@ -152,8 +152,8 @@ func TestEarlyCloseAndBodyLimitAreExplicit(t *testing.T) {
 			t.Fatal("early close was reported as complete")
 		}
 		if limit == 65536 {
-			if row.Reason != "body_limit" || len(row.Request)+len(row.Response) != 0 {
-				t.Fatal("oversized raw body must be discarded")
+			if row.Reason != "body_limit" || string(row.Request) != "{}" || string(row.Response) != strings.Repeat("x", limit-2) {
+				t.Fatal("oversized raw body must retain the exact bounded prefix")
 			}
 		} else if row.Reason != "closed_early" || len(row.Response) != 70000 {
 			t.Fatal("partial bytes must be retained explicitly")
@@ -216,7 +216,7 @@ func TestSendingRechecksExclusionAndNeverSpools(t *testing.T) {
 	}
 }
 
-func TestCapturePressureDiscardsBodiesAndReleasesTheAttemptBudget(t *testing.T) {
+func TestCapturePressureAndQueueReleaseTheAttemptBudget(t *testing.T) {
 	c, _, _ := fixture(t, policy{Version: 1, Enabled: true, Limit: 65536})
 	s, ok := bind(context.Background(), c, 1, 2, "").Value(scopeKey).(*scope)
 	if !ok {
@@ -244,5 +244,34 @@ func TestCapturePressureDiscardsBodiesAndReleasesTheAttemptBudget(t *testing.T) 
 	}
 	if c.used.Load() != 0 {
 		t.Fatal("queued bodies leaked their budget")
+	}
+}
+
+func TestOverflowRetainsPriorFramesAndBytesWithoutExceedingBudget(t *testing.T) {
+	c, _, _ := fixture(t, policy{Version: 1, Enabled: true, Limit: 65536})
+	ctx := bind(context.Background(), c, 1, 2, "")
+	RecordFrame(ctx, 3, "out", []byte(`{"type":"response.create"}`), false)
+	RecordFrame(ctx, 3, "in", []byte(strings.Repeat("x", 65536)), false)
+	Finish(ctx)
+	row := next(t, c)
+	if row.Complete || row.Reason != "body_limit" || len(row.Frames) != 1 || string(row.Request) != `{"type":"response.create"}` {
+		t.Fatal("frame overflow must keep complete earlier messages")
+	}
+	s, ok := bind(context.Background(), c, 1, 2, "").Value(scopeKey).(*scope)
+	if !ok {
+		t.Fatal("capture scope was not bound")
+	}
+	a := s.begin(3, "upstream.example", "/v1/responses", "POST", "JSON")
+	a.append("request", []byte("prefix"), nil)
+	c.used.Store(64 * 1024 * 1024)
+	a.append("response", []byte("overflow"), nil)
+	if string(a.row.Request) != "prefix" || len(a.row.Response) != 0 || a.row.Reason != "memory_limit" || a.used != 6 {
+		t.Fatal("memory overflow must preserve the reserved prefix")
+	}
+	c.used.Store(a.used)
+	a.finish(false, "")
+	next(t, c)
+	if c.used.Load() != 0 {
+		t.Fatal("retained bytes leaked their budget")
 	}
 }
