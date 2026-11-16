@@ -17,7 +17,7 @@ Policies are checked before capture, before sending and again before database in
 
 The collector has a 64 MiB capture budget, 32-item queue, configurable per-attempt limit (default 8 MiB), a 200ms policy deadline and 2s send deadline. Early close, bounds, process failure and delivery failure can leave incomplete or missing archives. Collection does not guarantee lossless traffic auditing. The operations center provides complete/partial/missing states, policy versions, attempt chains and non-identifying aggregate drops.
 
-Operator documentation: [operations-center conversation logs](https://github.com/fjiangming/sub2api-extra/blob/dev/operations-center/docs/conversation-logs.md).
+Operator documentation: [operations-center conversation logs](https://github.com/fjiangming/sub2api-extra/blob/main/operations-center/docs/conversation-logs.md). The companion operations center is released from its main branch as `ghcr.io/fjiangming/sub2api-extra:operations-center-latest`; update it separately from the core application.
 
 Fresh dev is based on upstream main 530c5e3a. Previous dev billing recovery changes are intentionally not carried forward. The existing companion billing-recovery UI may report unavailable against the fresh native core; this archive does not restore those unrelated custom APIs.
 
