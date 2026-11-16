@@ -20,6 +20,7 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 
 func fixture(t *testing.T, p policy) (*collector, *policy, *sync.Mutex) {
 	t.Helper()
+	p.CaptureVersion = 2
 	mu := &sync.Mutex{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer test-collector-token" {
@@ -36,6 +37,11 @@ func fixture(t *testing.T, p policy) (*collector, *policy, *sync.Mutex) {
 	}))
 	t.Cleanup(server.Close)
 	c := &collector{base: server.URL, token: "test-collector-token", http: server.Client(), queue: make(chan *attempt, 32)}
+	c.frames = make(chan *frameObservation, 16384)
+	stopped := make(chan struct{})
+	go func() { c.runFrames(); close(stopped) }()
+	t.Cleanup(func() { close(c.frames); <-stopped })
+	c.refreshPolicy()
 	return c, &p, mu
 }
 
@@ -45,6 +51,7 @@ func next(t *testing.T, c *collector) event {
 	case a := <-c.queue:
 		a.mu.Lock()
 		defer a.mu.Unlock()
+		a.prepareLocked()
 		row := a.row
 		a.clearLocked()
 		return row
@@ -52,6 +59,12 @@ func next(t *testing.T, c *collector) event {
 		t.Fatal("archive was not finalized")
 		return event{}
 	}
+}
+
+func flushFrames(c *collector) {
+	done := make(chan struct{})
+	c.frames <- &frameObservation{barrier: done}
+	<-done
 }
 
 func TestHTTPPreservesActualBytesAndRetryIdentity(t *testing.T) {
@@ -129,13 +142,14 @@ func TestExclusionAndPolicyFailureLeaveInferenceUntouched(t *testing.T) {
 		mu.Lock()
 		p.Version = 0
 		mu.Unlock()
+		c.refreshPolicy()
 	}
 	if c.dropped.Load() != 1 {
 		t.Fatal("policy failure should be counted without user metadata")
 	}
 }
 
-func TestEarlyCloseAndBodyLimitAreExplicit(t *testing.T) {
+func TestEarlyCloseRetainsObservedBytesWithoutLegacyTruncation(t *testing.T) {
 	for _, limit := range []int{65536, 131072} {
 		c, _, _ := fixture(t, policy{Version: 1, Enabled: true, Limit: limit})
 		base := roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -151,11 +165,7 @@ func TestEarlyCloseAndBodyLimitAreExplicit(t *testing.T) {
 		if row.Complete {
 			t.Fatal("early close was reported as complete")
 		}
-		if limit == 65536 {
-			if row.Reason != "body_limit" || string(row.Request) != "{}" || string(row.Response) != strings.Repeat("x", limit-2) {
-				t.Fatal("oversized raw body must retain the exact bounded prefix")
-			}
-		} else if row.Reason != "closed_early" || len(row.Response) != 70000 {
+		if row.Reason != "closed_early" || len(row.Response) != 70000 || string(row.Request) != "{}" {
 			t.Fatal("partial bytes must be retained explicitly")
 		}
 		if c.used.Load() != 0 {
@@ -203,6 +213,7 @@ func TestSendingRechecksExclusionAndNeverSpools(t *testing.T) {
 	ctx := bind(context.Background(), c, 1, 2, "")
 	RecordFrame(ctx, 3, "out", []byte(`{"type":"response.create"}`), false)
 	Finish(ctx)
+	flushFrames(c)
 	mu.Lock()
 	p.Excluded = []int64{1}
 	mu.Unlock()
@@ -226,9 +237,8 @@ func TestCapturePressureAndQueueReleaseTheAttemptBudget(t *testing.T) {
 	c.used.Store(64 * 1024 * 1024)
 	a.append("request", []byte("secret"), nil)
 	a.finish(false, "")
-	row := next(t, c)
-	if row.Reason != "memory_limit" || len(row.Request) != 0 {
-		t.Fatal("memory pressure retained the body")
+	if len(c.queue) != 0 || !a.abandoned || len(a.requestChunks) != 0 {
+		t.Fatal("memory pressure must abandon the whole archive")
 	}
 	c.used.Store(0)
 	for i := 0; i < 33; i++ {
@@ -236,7 +246,7 @@ func TestCapturePressureAndQueueReleaseTheAttemptBudget(t *testing.T) {
 		a.append("request", []byte("{}"), io.EOF)
 		a.finish(true, "")
 	}
-	if c.dropped.Load() != 1 {
+	if c.dropped.Load() != 2 {
 		t.Fatal("full queue was not counted")
 	}
 	for i := 0; i < 32; i++ {
@@ -247,15 +257,15 @@ func TestCapturePressureAndQueueReleaseTheAttemptBudget(t *testing.T) {
 	}
 }
 
-func TestOverflowRetainsPriorFramesAndBytesWithoutExceedingBudget(t *testing.T) {
+func TestLegacyFrameLimitIsIgnoredAndMemoryPressureAbandonsAllBytes(t *testing.T) {
 	c, _, _ := fixture(t, policy{Version: 1, Enabled: true, Limit: 65536})
 	ctx := bind(context.Background(), c, 1, 2, "")
 	RecordFrame(ctx, 3, "out", []byte(`{"type":"response.create"}`), false)
 	RecordFrame(ctx, 3, "in", []byte(strings.Repeat("x", 65536)), false)
 	Finish(ctx)
 	row := next(t, c)
-	if row.Complete || row.Reason != "body_limit" || len(row.Frames) != 1 || string(row.Request) != `{"type":"response.create"}` {
-		t.Fatal("frame overflow must keep complete earlier messages")
+	if row.Reason != "session_closed" || len(row.Frames) != 2 || len(row.Response) != 65536 {
+		t.Fatal("legacy attempt size must not truncate frames")
 	}
 	s, ok := bind(context.Background(), c, 1, 2, "").Value(scopeKey).(*scope)
 	if !ok {
@@ -265,12 +275,14 @@ func TestOverflowRetainsPriorFramesAndBytesWithoutExceedingBudget(t *testing.T) 
 	a.append("request", []byte("prefix"), nil)
 	c.used.Store(64 * 1024 * 1024)
 	a.append("response", []byte("overflow"), nil)
-	if string(a.row.Request) != "prefix" || len(a.row.Response) != 0 || a.row.Reason != "memory_limit" || a.used != 6 {
-		t.Fatal("memory overflow must preserve the reserved prefix")
+	if len(a.requestChunks) != 0 || len(a.row.Response) != 0 || a.row.Reason != "memory_limit" || a.used != 0 || !a.abandoned {
+		t.Fatal("memory overflow must release the entire archive")
 	}
-	c.used.Store(a.used)
+	c.used.Store(0)
 	a.finish(false, "")
-	next(t, c)
+	if len(c.queue) != 0 {
+		t.Fatal("abandoned archive was queued")
+	}
 	if c.used.Load() != 0 {
 		t.Fatal("retained bytes leaked their budget")
 	}

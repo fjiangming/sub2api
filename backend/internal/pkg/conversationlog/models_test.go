@@ -70,8 +70,8 @@ func TestHTTPModelFilterPreservesInferenceAndIdentifiesLargeRequestsAndURLModels
 				if row.Model != sample.model || string(row.Request) != sample.body || !row.Complete {
 					t.Fatal("selected model archive was incomplete or changed")
 				}
-			} else if len(c.queue) != 0 {
-				t.Fatal("unselected model created an archive event")
+			} else {
+				assertDenied(t, c)
 			}
 			if c.used.Load() != 0 || c.dropped.Load() != 0 {
 				t.Fatal("model exclusion leaked memory or created a gap")
@@ -102,9 +102,26 @@ func TestWebSocketNestedModelInheritanceAndLaterSelectedSegments(t *testing.T) {
 			if len(row.Frames) != 2 || row.Model == "" || !row.Complete {
 				t.Fatal("selected WebSocket segment lost model or frames")
 			}
-		} else if len(c.queue) != 0 || c.used.Load() != 0 {
-			t.Fatal("unselected WebSocket segment was retained")
+		} else {
+			assertDenied(t, c)
 		}
+	}
+}
+
+func assertDenied(t *testing.T, c *collector) {
+	t.Helper()
+	flushFrames(c)
+	select {
+	case a := <-c.queue:
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.prepareLocked()
+		if a.modelAllowedLocked(a.policy) {
+			t.Fatal("unselected model passed the send gate")
+		}
+		a.clearLocked()
+	default:
+		t.Fatal("missing observed attempt")
 	}
 }
 
@@ -113,6 +130,7 @@ func TestModelFilterRechecksQueuedEventsBeforeSending(t *testing.T) {
 	ctx := bind(context.Background(), c, 1, 2, "")
 	RecordFrame(ctx, 3, "out", []byte(`{"model":"gpt-6.1-sol","Model":"gpt-6-sol"}`), false)
 	Finish(ctx)
+	flushFrames(c)
 	if len(c.queue) != 1 {
 		t.Fatal("selected event was not queued")
 	}

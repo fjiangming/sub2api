@@ -7,6 +7,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -34,6 +35,7 @@ type policy struct {
 	Enabled            bool     `json:"enabled"`
 	Excluded           []int64  `json:"excluded_user_ids"`
 	Limit              int      `json:"max_body_bytes"`
+	CaptureVersion     int      `json:"capture_version"`
 	ModelFilterVersion int      `json:"model_filter_version"`
 	ModelFilterEnabled bool     `json:"model_filter_enabled"`
 	AllowedModels      []string `json:"allowed_models"`
@@ -46,35 +48,41 @@ type frame struct {
 	Binary    bool   `json:"binary"`
 }
 type event struct {
-	Schema        int     `json:"schema"`
-	ID            string  `json:"id"`
-	RequestID     string  `json:"request_id"`
-	UserID        int64   `json:"user_id"`
-	KeyID         int64   `json:"key_id"`
-	AccountID     int64   `json:"account_id"`
-	Session       string  `json:"session_id"`
-	At            int64   `json:"at"`
-	Duration      int64   `json:"duration_ms"`
-	Host          string  `json:"host"`
-	Path          string  `json:"path"`
-	Method        string  `json:"method"`
-	Protocol      string  `json:"protocol"`
-	Model         string  `json:"model"`
-	Status        int     `json:"status"`
-	Complete      bool    `json:"complete"`
-	Reason        string  `json:"reason"`
-	PolicyVersion int     `json:"policy_version"`
-	Encoding      string  `json:"encoding"`
-	Request       []byte  `json:"request"`
-	Response      []byte  `json:"response"`
-	Frames        []frame `json:"frames"`
+	Schema         int     `json:"schema"`
+	ID             string  `json:"id"`
+	RequestID      string  `json:"request_id"`
+	UserID         int64   `json:"user_id"`
+	KeyID          int64   `json:"key_id"`
+	AccountID      int64   `json:"account_id"`
+	Session        string  `json:"session_id"`
+	At             int64   `json:"at"`
+	Duration       int64   `json:"duration_ms"`
+	Host           string  `json:"host"`
+	Path           string  `json:"path"`
+	Method         string  `json:"method"`
+	Protocol       string  `json:"protocol"`
+	Model          string  `json:"model"`
+	Status         int     `json:"status"`
+	Complete       bool    `json:"complete"`
+	Reason         string  `json:"reason"`
+	PolicyVersion  int     `json:"policy_version"`
+	Encoding       string  `json:"encoding"`
+	Request        []byte  `json:"request"`
+	Response       []byte  `json:"response"`
+	Frames         []frame `json:"frames"`
+	CaptureVersion int     `json:"capture_version"`
+	BodySHA256     string  `json:"body_sha256"`
 }
 type collector struct {
 	base, token string
 	http        *http.Client
 	queue       chan *attempt
+	frames      chan *frameObservation
 	used        atomic.Int64
 	dropped     atomic.Uint64
+	policyMu    sync.RWMutex
+	cached      policy
+	policyUntil time.Time
 }
 type scope struct {
 	client            *collector
@@ -82,23 +90,37 @@ type scope struct {
 	id, session, path string
 	mu                sync.Mutex
 	ws                *attempt
-	wsDenied          bool
 	wsModels          []string
+	failed            atomic.Bool
+	closed            atomic.Bool
+	closedAt          atomic.Int64
+	pending           atomic.Int64
 }
 type attempt struct {
-	client                    *collector
-	mu                        sync.Mutex
-	row                       event
-	start                     time.Time
-	limit                     int
-	used                      int64
-	finished                  bool
-	requestDone               bool
-	responseDone              bool
-	requestSize, responseSize int64
-	policy                    policy
-	models                    []string
-	contentType               string
+	client                        *collector
+	mu                            sync.Mutex
+	row                           event
+	start                         time.Time
+	used                          int64
+	requestChunks, responseChunks [][]byte
+	abandoned                     bool
+	finished                      bool
+	requestDone                   bool
+	responseDone                  bool
+	requestSize, responseSize     int64
+	policy                        policy
+	models                        []string
+	contentType                   string
+}
+
+type frameObservation struct {
+	scope   *scope
+	frame   frame
+	account int64
+	at      time.Time
+	policy  policy
+	used    int64
+	barrier chan struct{}
 }
 
 var globalOnce sync.Once
@@ -122,13 +144,15 @@ func current() *collector {
 	return global
 }
 func newCollector(base, token string) *collector {
-	c := &collector{base: base, token: token, queue: make(chan *attempt, 32), http: &http.Client{
+	c := &collector{base: base, token: token, queue: make(chan *attempt, 32), frames: make(chan *frameObservation, 16384), http: &http.Client{
 		Timeout:       2 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Transport: &http.Transport{Proxy: nil, MaxConnsPerHost: 8, MaxIdleConnsPerHost: 8, IdleConnTimeout: 30 * time.Second,
 			DialContext: (&net.Dialer{Timeout: 200 * time.Millisecond, KeepAlive: 30 * time.Second}).DialContext},
 	}}
 	go c.run()
+	go c.runFrames()
+	go c.refreshPolicies()
 	return c
 }
 func randomID() string {
@@ -149,6 +173,13 @@ func Bind(ctx context.Context, userID, keyID int64, session string, paths ...str
 }
 func bind(ctx context.Context, c *collector, userID, keyID int64, session string) context.Context {
 	if c == nil || userID <= 0 || keyID <= 0 {
+		return ctx
+	}
+	p, valid := c.cachedPolicy()
+	if !valid || !p.allows(userID) {
+		if !valid {
+			c.dropped.Add(1)
+		}
 		return ctx
 	}
 	s := &scope{client: c, user: userID, key: keyID, id: randomID()}
@@ -183,11 +214,17 @@ func Finish(ctx context.Context) {
 	if s == nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ws != nil {
-		s.ws.finish(false, "session_closed")
-		s.ws = nil
+	if !s.mu.TryLock() {
+		s.failObservation(true)
+		s.closed.Store(true)
+		return
+	}
+	s.closedAt.Store(time.Now().UnixNano())
+	s.closed.Store(true)
+	s.mu.Unlock()
+	select {
+	case s.client.frames <- &frameObservation{scope: s}:
+	default:
 	}
 }
 func (c *collector) getPolicy() (policy, bool) {
@@ -199,6 +236,7 @@ func (c *collector) getPolicy() (policy, bool) {
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("X-Conversation-Dropped", strconv.FormatUint(c.dropped.Load(), 10))
+	req.Header.Set("X-Conversation-Collector-Version", "2")
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return policy{}, false
@@ -209,7 +247,7 @@ func (c *collector) getPolicy() (policy, bool) {
 	}
 	var p policy
 	err = json.NewDecoder(io.LimitReader(resp.Body, 65536)).Decode(&p)
-	valid := err == nil && p.Version > 0 && p.Limit >= 65536 && p.Limit <= 16777216 && len(p.Excluded) <= 1000 && len(p.AllowedModels) <= 100
+	valid := err == nil && p.Version > 0 && p.CaptureVersion == 2 && len(p.Excluded) <= 1000 && len(p.AllowedModels) <= 100
 	if p.ModelFilterEnabled {
 		valid = valid && p.ModelFilterVersion == 1
 		for _, model := range p.AllowedModels {
@@ -217,6 +255,33 @@ func (c *collector) getPolicy() (policy, bool) {
 		}
 	}
 	return p, valid
+}
+
+// Policy outages skip observation; request goroutines never perform archive network or disk I/O.
+func (c *collector) refreshPolicy() {
+	p, ok := c.getPolicy()
+	c.policyMu.Lock()
+	defer c.policyMu.Unlock()
+	if ok {
+		c.cached, c.policyUntil = p, time.Now().Add(3*time.Second)
+	} else {
+		c.policyUntil = time.Time{}
+	}
+}
+func (c *collector) refreshPolicies() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		c.refreshPolicy()
+		<-ticker.C
+	}
+}
+func (c *collector) cachedPolicy() (policy, bool) {
+	if !c.policyMu.TryRLock() {
+		return policy{}, false
+	}
+	defer c.policyMu.RUnlock()
+	return c.cached, time.Now().Before(c.policyUntil)
 }
 func (p policy) allows(user int64) bool {
 	if !p.Enabled {
@@ -230,7 +295,7 @@ func (p policy) allows(user int64) bool {
 	return true
 }
 func (s *scope) begin(account int64, host, path, method, protocol string) *attempt {
-	p, ok := s.client.getPolicy()
+	p, ok := s.client.cachedPolicy()
 	if !ok || !p.allows(s.user) {
 		if !ok {
 			s.client.dropped.Add(1)
@@ -242,7 +307,7 @@ func (s *scope) begin(account int64, host, path, method, protocol string) *attem
 		return nil
 	}
 	now := time.Now()
-	return &attempt{client: s.client, limit: p.Limit, policy: p, start: now, row: event{Schema: 1, ID: id, RequestID: s.id,
+	return &attempt{client: s.client, policy: p, start: now, row: event{Schema: 1, CaptureVersion: 2, ID: id, RequestID: s.id,
 		UserID: s.user, KeyID: s.key, AccountID: account, Session: s.session, At: now.UnixMilli(), Host: host, Path: path, Method: method,
 		Protocol: protocol, PolicyVersion: p.Version, Request: []byte{}, Response: []byte{}, Frames: []frame{}}}
 }
@@ -250,26 +315,32 @@ func (a *attempt) clearLocked() {
 	a.client.used.Add(-a.used)
 	a.used = 0
 	a.row.Request, a.row.Response, a.row.Frames = []byte{}, []byte{}, []frame{}
+	a.requestChunks, a.responseChunks = nil, nil
 }
 func (a *attempt) reserveLocked(n int) bool {
-	if a.row.Reason == "body_limit" || a.row.Reason == "memory_limit" {
+	if a.abandoned {
 		return false
 	}
-	if a.used+int64(n) > int64(a.limit) {
-		a.row.Reason = "body_limit"
+	if !a.client.reserveObservation(int64(n)) {
+		a.row.Reason = "memory_limit"
+		a.abandoned = true
+		a.clearLocked()
 		return false
 	}
-	for {
-		used := a.client.used.Load()
-		if used+int64(n) > 64*1024*1024 {
-			a.row.Reason = "memory_limit"
+	a.used += int64(n)
+	return true
+}
+func (c *collector) reserveObservation(n int64) bool {
+	for retry := 0; retry < 8; retry++ {
+		used := c.used.Load()
+		if used+n > 64*1024*1024 {
 			return false
 		}
-		if a.client.used.CompareAndSwap(used, used+int64(n)) {
-			a.used += int64(n)
+		if c.used.CompareAndSwap(used, used+n) {
 			return true
 		}
 	}
+	return false
 }
 func (a *attempt) append(side string, data []byte, err error) {
 	a.mu.Lock()
@@ -291,33 +362,41 @@ func (a *attempt) append(side string, data []byte, err error) {
 	if err != nil && err != io.EOF && a.row.Reason == "" {
 		a.row.Reason = "read_error"
 	}
-	// Keep the observed prefix on overflow; the gateway still consumes the original stream unchanged.
-	size := min(len(data), max(0, a.limit-int(a.used)))
-	if size > 0 && a.reserveLocked(size) {
-		if side == "request" {
-			a.row.Request = append(a.row.Request, data[:size]...)
-		} else {
-			a.row.Response = append(a.row.Response, data[:size]...)
-		}
+	// Batch tiny SSE reads without reallocating or repeatedly copying the accumulated body.
+	chunks := &a.responseChunks
+	if side == "request" {
+		chunks = &a.requestChunks
 	}
-	if len(data) > size && a.row.Reason != "memory_limit" {
-		a.row.Reason = "body_limit"
+	for len(data) > 0 && !a.abandoned {
+		if len(*chunks) == 0 || len((*chunks)[len(*chunks)-1]) == cap((*chunks)[len(*chunks)-1]) {
+			if !a.reserveLocked(16384 + 32) {
+				break
+			}
+			*chunks = append(*chunks, make([]byte, 0, 16384))
+		}
+		last := &(*chunks)[len(*chunks)-1]
+		n := min(len(data), cap(*last)-len(*last))
+		*last = append(*last, data[:n]...)
+		data = data[n:]
 	}
 }
 func (a *attempt) finish(complete bool, reason string) {
+	a.finishAt(complete, reason, time.Now())
+}
+func (a *attempt) finishAt(complete bool, reason string, at time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.finished {
 		return
 	}
 	a.finished = true
-	a.row.Duration = min(time.Since(a.start).Milliseconds(), 86400000)
+	a.row.Duration = max(0, at.Sub(a.start).Milliseconds())
 	if a.row.Reason == "" {
 		a.row.Reason = reason
 	}
 	a.row.Complete = complete && a.row.Reason == ""
-	a.identifyLocked()
-	if !a.modelAllowedLocked(a.policy) {
+	if a.abandoned {
+		a.client.dropped.Add(1)
 		a.clearLocked()
 		return
 	}
@@ -328,35 +407,95 @@ func (a *attempt) finish(complete bool, reason string) {
 		a.clearLocked()
 	}
 }
+
+func (a *attempt) prepareLocked() {
+	if a.row.Protocol != "WebSocket" {
+		a.row.Request, a.row.Response = bytes.Join(a.requestChunks, nil), bytes.Join(a.responseChunks, nil)
+		a.requestChunks, a.responseChunks = nil, nil
+	}
+	a.identifyLocked()
+}
+
+func bodyDigest(row event) string {
+	h := sha256.New()
+	writeNumber := func(n uint64) { var b [8]byte; binary.BigEndian.PutUint64(b[:], n); _, _ = h.Write(b[:]) }
+	writeBody := func(b []byte) { writeNumber(uint64(len(b))); _, _ = h.Write(b) }
+	writeBody(row.Request)
+	writeBody(row.Response)
+	writeNumber(uint64(len(row.Frames)))
+	for _, f := range row.Frames {
+		_, _ = h.Write([]byte(f.Direction))
+		writeNumber(uint64(f.At))
+		if f.Binary {
+			_, _ = h.Write([]byte{1})
+		} else {
+			_, _ = h.Write([]byte{0})
+		}
+		writeBody(f.Body)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func (c *collector) run() {
 	for a := range c.queue {
-		a.mu.Lock()
-		p, ok := c.getPolicy()
-		if ok && p.allows(a.row.UserID) && a.modelAllowedLocked(p) {
-			body, err := json.Marshal(a.row)
-			if err == nil {
-				req, buildErr := http.NewRequest(http.MethodPost, c.base+"/api/conversation-logs/ingest", bytes.NewReader(body))
-				if buildErr == nil {
-					req.Header.Set("Authorization", "Bearer "+c.token)
-					req.Header.Set("Content-Type", "application/json")
-					resp, sendErr := c.http.Do(req)
-					if sendErr != nil {
-						c.dropped.Add(1)
-					} else {
-						if resp.StatusCode != http.StatusOK {
-							c.dropped.Add(1)
-						}
-						_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-						_ = resp.Body.Close()
-					}
-				}
+		// finish transfers ownership of captured bytes; delivery must never lock late observer reads.
+		a.prepareDelivery()
+		if a.modelAllowedLocked(a.policy) {
+			a.row.BodySHA256 = a.capturedDigest()
+			if !c.deliver(a) {
+				c.dropped.Add(1)
 			}
-		} else if !ok {
-			c.dropped.Add(1)
 		}
 		a.clearLocked()
-		a.mu.Unlock()
 	}
+}
+
+func (c *collector) deliver(a *attempt) bool {
+	for retry := 0; retry < 3; retry++ {
+		p, ok := c.getPolicy()
+		if !ok {
+			return false
+		}
+		if !p.allows(a.row.UserID) || !a.modelAllowedLocked(p) {
+			return true
+		}
+		body, length, stop, err := a.streamEnvelope()
+		if err != nil {
+			return false
+		}
+		req, err := http.NewRequest(http.MethodPost, c.base+"/api/conversation-logs/ingest", body)
+		if err != nil {
+			stop()
+			return false
+		}
+		req.ContentLength = length
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := c.http.Do(req)
+		stop()
+		if err == nil {
+			var ack struct {
+				Accepted   bool   `json:"accepted"`
+				ID         string `json:"id"`
+				BodySHA256 string `json:"body_sha256"`
+				Reason     string `json:"reason"`
+			}
+			decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&ack)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK && decodeErr == nil {
+				if !ack.Accepted {
+					return ack.Reason == "" || ack.Reason == "excluded"
+				}
+				if ack.ID == a.row.ID && ack.BodySHA256 == a.row.BodySHA256 {
+					return true
+				}
+			}
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != 429 {
+				return false
+			}
+		}
+	}
+	return false
 }
 
 type transport struct{ base http.RoundTripper }
@@ -392,7 +531,11 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	copyReq := req.Clone(req.Context())
 	a.requestDone = req.Body == nil || req.Body == http.NoBody
 	if req.Body != nil {
-		copyReq.Body = &observedBody{ReadCloser: req.Body, attempt: a, side: "request", expected: req.ContentLength}
+		expected := req.ContentLength
+		if expected == 0 && req.Body != http.NoBody {
+			expected = -1
+		}
+		copyReq.Body = &observedBody{ReadCloser: req.Body, attempt: a, side: "request", expected: expected}
 	}
 	resp, err := t.base.RoundTrip(copyReq)
 	if err != nil {
@@ -433,6 +576,38 @@ func (b *observedBody) Read(p []byte) (int, error) {
 	b.attempt.append(b.side, p[:n], err)
 	return n, err
 }
+
+// Preserve WriterTo (notably bytes.Reader request bodies) instead of forcing many small socket writes.
+func (b *observedBody) WriteTo(writer io.Writer) (int64, error) {
+	observed := &observedWriter{Writer: writer, body: b}
+	var n int64
+	var err error
+	if fast, ok := b.ReadCloser.(io.WriterTo); ok {
+		n, err = fast.WriteTo(observed)
+	} else {
+		n, err = io.Copy(observed, b.ReadCloser)
+	}
+	if err == nil {
+		b.attempt.append(b.side, nil, io.EOF)
+	} else if !observed.writeFailed {
+		b.attempt.append(b.side, nil, err)
+	}
+	return n, err
+}
+
+type observedWriter struct {
+	io.Writer
+	body        *observedBody
+	writeFailed bool
+}
+
+func (w *observedWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	w.body.attempt.append(w.body.side, p[:n], nil)
+	w.writeFailed = err != nil || n != len(p)
+	return n, err
+}
+
 func (b *observedBody) Close() error {
 	b.once.Do(func() {
 		b.closeErr = b.ReadCloser.Close()
@@ -459,58 +634,36 @@ func RecordFrame(ctx context.Context, account int64, direction string, body []by
 	if s == nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.wsDenied {
+	if s.failed.Load() || s.closed.Load() {
 		return
 	}
-	if s.ws == nil {
-		path := s.path
-		if path == "" {
-			path = "/v1/responses"
-		}
-		s.ws = s.begin(account, "", path, "WS", "WebSocket")
-		if s.ws == nil {
-			s.wsDenied = true
-			return
-		}
-		s.ws.row.Status = http.StatusSwitchingProtocols
-		if len(s.wsModels) > 0 {
-			s.ws.models = append([]string(nil), s.wsModels...)
-		}
+	p, valid := s.client.cachedPolicy()
+	if !valid || !p.allows(s.user) {
+		s.failObservation(!valid)
+		return
 	}
-	a := s.ws
-	a.mu.Lock()
-	if direction == "out" && !binary {
-		if models := bodyModels(body, "application/json", true); len(models) > 0 {
-			s.wsModels = models
-			if len(a.row.Frames) == 0 {
-				a.models = nil
-			}
-			a.models = append(a.models, models...)
-		}
+	// Never wait behind another direction's observer; pressure sacrifices this archive, not relay progress.
+	if !s.mu.TryLock() {
+		s.failObservation(true)
+		return
 	}
-	if len(a.row.Frames) >= 10000 {
-		a.row.Reason = "body_limit"
+	defer s.mu.Unlock()
+	if s.failed.Load() || s.closed.Load() {
+		return
 	}
-	if a.reserveLocked(len(body)) {
-		data := append([]byte{}, body...)
-		a.row.Frames = append(a.row.Frames, frame{Direction: direction, At: time.Since(a.start).Milliseconds(), Body: data, Binary: binary})
-		if direction == "out" && len(a.row.Request) == 0 {
-			a.row.Request = data
-		}
-		if direction == "in" {
-			a.row.Response = data
-		}
+	n := int64(len(body)) + 256
+	if !s.client.reserveObservation(n) {
+		s.failObservation(true)
+		return
 	}
-	a.mu.Unlock()
-	if direction == "in" && !binary {
-		var message struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal(body, &message) == nil && (message.Type == "response.completed" || message.Type == "response.failed" || message.Type == "response.incomplete") {
-			a.finish(true, "")
-			s.ws = nil
-		}
+	work := &frameObservation{scope: s, account: account, at: time.Now(), policy: p, used: n,
+		frame: frame{Direction: direction, Binary: binary, Body: append([]byte{}, body...)}}
+	s.pending.Add(1)
+	select {
+	case s.client.frames <- work:
+	default:
+		s.pending.Add(-1)
+		s.client.used.Add(-n)
+		s.failObservation(true)
 	}
 }
