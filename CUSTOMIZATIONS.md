@@ -1,5 +1,16 @@
 # Fork Customizations
 
+## 2026-11-16: Conversation capture model selection
+
+User requested a configurable upstream-model whitelist and confirmed Kimi K3 and subsequent versions. Complete this feature before implementing external log push policies. Preserve exclusions, history, encryption keys, inference bytes, cancellation, billing and unrelated work.
+
+- `backend/internal/pkg/conversationlog/capture.go`: accept versioned model policy fields, validate bounds, retain the attempt policy, identify actual outbound model metadata before queueing and recheck every candidate against current policy before sending. Denied models release bounded memory without an archive or identifying gap. Gemini/Vertex model paths and per-lease WebSocket model candidate inheritance are supported.
+- `backend/internal/pkg/conversationlog/models.go` (new): reuse the existing requestmodel parser for JSON/multipart, including duplicate/case-variant candidates, plus nested WebSocket response model fields. Remove the old 1 MiB metadata extraction skip. Match named models with case/space and Fable/Opus/Gemini/Kimi canonicalization, exact versions and optional Kimi K3+ range.
+- `backend/internal/pkg/conversationlog/models_test.go` (new): selected/unselected/unknown/duplicate models, explicit Kimi aliases and range boundaries, 2 MiB requests and Gemini paths, exact inference bytes, WebSocket inheritance across accepted/rejected segments, changed queued-policy candidates and unsupported policy contracts failing closed for capture only.
+- `CONVERSATION_LOGS.md`, `CUSTOMIZATIONS.md`: model selection, legacy-policy compatibility, both-component rollout, historical access and bounded observation before identification. No new dependency, spool, gateway API, environment variable or billing mutation.
+
+Local verification: all 12 collector tests passed. Companion operations center passed all 417 tests, syntax checks and 29 focused archive/model/performance/reprocessing tests; four Chrome desktop/mobile/narrow/dark flows covered model configuration and rejection with existing raw/reprocessing behavior. Windows has no C compiler; race remains required in the existing Linux release gate. Publication/deployment results will be recorded after completion. Companion UI/store/tests are maintained in extra main; unrelated local maintenance entries are not included in the source commit.
+
 ## 2026-11-16: Retain bounded conversation capture on overflow
 
 User requested better conversation archive compatibility, preserving source on processing errors and one-click reprocessing in the companion operations center. Source inspection also confirmed that bounds previously erased all captured request/response bytes.

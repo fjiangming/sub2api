@@ -30,10 +30,14 @@ const (
 )
 
 type policy struct {
-	Version  int     `json:"version"`
-	Enabled  bool    `json:"enabled"`
-	Excluded []int64 `json:"excluded_user_ids"`
-	Limit    int     `json:"max_body_bytes"`
+	Version            int      `json:"version"`
+	Enabled            bool     `json:"enabled"`
+	Excluded           []int64  `json:"excluded_user_ids"`
+	Limit              int      `json:"max_body_bytes"`
+	ModelFilterVersion int      `json:"model_filter_version"`
+	ModelFilterEnabled bool     `json:"model_filter_enabled"`
+	AllowedModels      []string `json:"allowed_models"`
+	KimiK3Plus         bool     `json:"kimi_k3_plus"`
 }
 type frame struct {
 	Direction string `json:"direction"`
@@ -79,6 +83,7 @@ type scope struct {
 	mu                sync.Mutex
 	ws                *attempt
 	wsDenied          bool
+	wsModels          []string
 }
 type attempt struct {
 	client                    *collector
@@ -91,11 +96,14 @@ type attempt struct {
 	requestDone               bool
 	responseDone              bool
 	requestSize, responseSize int64
+	policy                    policy
+	models                    []string
+	contentType               string
 }
 
 var globalOnce sync.Once
 var global *collector
-var modelName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$`)
+var modelName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._:/\[\]-]{0,199}$`)
 
 func current() *collector {
 	globalOnce.Do(func() {
@@ -201,7 +209,14 @@ func (c *collector) getPolicy() (policy, bool) {
 	}
 	var p policy
 	err = json.NewDecoder(io.LimitReader(resp.Body, 65536)).Decode(&p)
-	return p, err == nil && p.Version > 0 && p.Limit >= 65536 && p.Limit <= 16777216 && len(p.Excluded) <= 1000
+	valid := err == nil && p.Version > 0 && p.Limit >= 65536 && p.Limit <= 16777216 && len(p.Excluded) <= 1000 && len(p.AllowedModels) <= 100
+	if p.ModelFilterEnabled {
+		valid = valid && p.ModelFilterVersion == 1
+		for _, model := range p.AllowedModels {
+			valid = valid && modelName.MatchString(model)
+		}
+	}
+	return p, valid
 }
 func (p policy) allows(user int64) bool {
 	if !p.Enabled {
@@ -227,7 +242,7 @@ func (s *scope) begin(account int64, host, path, method, protocol string) *attem
 		return nil
 	}
 	now := time.Now()
-	return &attempt{client: s.client, limit: p.Limit, start: now, row: event{Schema: 1, ID: id, RequestID: s.id,
+	return &attempt{client: s.client, limit: p.Limit, policy: p, start: now, row: event{Schema: 1, ID: id, RequestID: s.id,
 		UserID: s.user, KeyID: s.key, AccountID: account, Session: s.session, At: now.UnixMilli(), Host: host, Path: path, Method: method,
 		Protocol: protocol, PolicyVersion: p.Version, Request: []byte{}, Response: []byte{}, Frames: []frame{}}}
 }
@@ -301,13 +316,10 @@ func (a *attempt) finish(complete bool, reason string) {
 		a.row.Reason = reason
 	}
 	a.row.Complete = complete && a.row.Reason == ""
-	if len(a.row.Request) <= 1024*1024 {
-		var metadata struct {
-			Model string `json:"model"`
-		}
-		if json.Unmarshal(a.row.Request, &metadata) == nil && modelName.MatchString(metadata.Model) {
-			a.row.Model = metadata.Model
-		}
+	a.identifyLocked()
+	if !a.modelAllowedLocked(a.policy) {
+		a.clearLocked()
+		return
 	}
 	select {
 	case a.client.queue <- a:
@@ -320,7 +332,7 @@ func (c *collector) run() {
 	for a := range c.queue {
 		a.mu.Lock()
 		p, ok := c.getPolicy()
-		if ok && p.allows(a.row.UserID) {
+		if ok && p.allows(a.row.UserID) && a.modelAllowedLocked(p) {
 			body, err := json.Marshal(a.row)
 			if err == nil {
 				req, buildErr := http.NewRequest(http.MethodPost, c.base+"/api/conversation-logs/ingest", bytes.NewReader(body))
@@ -369,6 +381,13 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	a := s.begin(account, req.URL.Hostname(), path, req.Method, "JSON")
 	if a == nil {
 		return t.base.RoundTrip(req)
+	}
+	a.contentType = req.Header.Get("Content-Type")
+	if _, part, found := strings.Cut(path, "/models/"); found {
+		part, _, _ = strings.Cut(part, ":")
+		if model, err := url.PathUnescape(part); err == nil && modelName.MatchString(model) {
+			a.models = []string{model}
+		}
 	}
 	copyReq := req.Clone(req.Context())
 	a.requestDone = req.Body == nil || req.Body == http.NoBody
@@ -456,9 +475,21 @@ func RecordFrame(ctx context.Context, account int64, direction string, body []by
 			return
 		}
 		s.ws.row.Status = http.StatusSwitchingProtocols
+		if len(s.wsModels) > 0 {
+			s.ws.models = append([]string(nil), s.wsModels...)
+		}
 	}
 	a := s.ws
 	a.mu.Lock()
+	if direction == "out" && !binary {
+		if models := bodyModels(body, "application/json", true); len(models) > 0 {
+			s.wsModels = models
+			if len(a.row.Frames) == 0 {
+				a.models = nil
+			}
+			a.models = append(a.models, models...)
+		}
+	}
 	if len(a.row.Frames) >= 10000 {
 		a.row.Reason = "body_limit"
 	}
