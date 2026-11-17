@@ -55,20 +55,6 @@ describe('RedeemView refresh after redemption', () => {
     vi.restoreAllMocks()
   })
 
-  it('displays an automatic activity reward as a rebate balance transfer with currency', async () => {
-    getHistory.mockResolvedValue({ total: 1, items: [{
-      id: 42, code: 'AC-REWARD', type: 'affiliate_balance', value: 0.5, used_at: '2026-11-17T00:00:00Z',
-    }] })
-    const wrapper = mount(RedeemView, {
-      global: { stubs: { AppLayout: { template: '<div><slot /></div>' }, Icon: true } },
-    })
-    await flushPromises()
-    expect(wrapper.text()).toContain('redeem.balanceAddedAffiliate')
-    expect(wrapper.text()).toContain('+$0.50')
-    expect(wrapper.text()).not.toContain('redeem.concurrencyAdded')
-    wrapper.unmount()
-  })
-
   it.each(['balance', 'concurrency', 'subscription'])(
     'keeps a successful %s redemption when profile refresh fails', async (type) => {
       redeem.mockResolvedValue({ type, value: 20, message: 'Code applied' })

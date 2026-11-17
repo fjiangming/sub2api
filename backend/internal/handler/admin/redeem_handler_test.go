@@ -63,29 +63,6 @@ func TestCreateAndRedeem_TypeDefaultsToBalance(t *testing.T) {
 		"omitting type should default to balance and pass validation")
 }
 
-func TestCreateAndRedeem_AffiliateRewardRequiresPositiveAmount(t *testing.T) {
-	for _, value := range []float64{0.5, 0, -0.5} {
-		code := postCreateAndRedeemValidation(t, newCreateAndRedeemHandler(), map[string]any{
-			"code": "activity-reward", "type": "affiliate_balance", "value": value, "user_id": 42,
-		})
-		if value > 0 {
-			require.NotEqual(t, http.StatusBadRequest, code)
-		} else {
-			require.Equal(t, http.StatusBadRequest, code)
-		}
-	}
-}
-
-func TestGenerateRedeemCodesRejectsAffiliateRewardType(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"count":1,"type":"affiliate_balance","value":0.5}`))
-	c.Request.Header.Set("Content-Type", "application/json")
-	var req GenerateRedeemCodesRequest
-	require.Error(t, c.ShouldBindJSON(&req))
-}
-
 func TestCreateAndRedeem_SubscriptionRequiresGroupID(t *testing.T) {
 	h := newCreateAndRedeemHandler()
 	code := postCreateAndRedeemValidation(t, h, map[string]any{

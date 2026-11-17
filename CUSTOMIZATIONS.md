@@ -1,5 +1,13 @@
 # Fork Customizations
 
+## 2026-11-17: Restore the original core reward contract
+
+The user confirms an activity-center-only implementation and explicitly requests undoing unnecessary core changes. Reverse only the 15 source / test / migration files introduced or modified by `6c46e2526`: restore the original redeem handler / service / balance-history merge, Ent schema and generated column width, user / administrator RedeemView types and rendering, and the affected existing tests; remove the two added affiliate fulfillment / history tests, the repository fixture and migration 251. Preserve unrelated local maintenance entries and go.sum state. Keep the previous entries as history.
+
+The companion extra service uses the existing ordinary balance fixed-code contract with 31-character codes and subsidy notes. New operator work stays entirely in activity-center, with the existing operations-center subsidy exclusion reused. No server deployment, production credit, balance deduction, schema narrowing or database rollback is performed.
+
+Verification: every reverted source / test / migration file matches `6c46e2526^` in Git content. Original relevant unit tests in service, admin handler and repository packages, the migrations package and Go vet passed. All 12 original user/admin RedeemView tests, 3 locale checks, vue-tsc and production Vite build passed. Companion extra passed all 60 activity tests, 112 related financial tests and four browser layouts including verified legacy-credit recovery. Scoped whitespace checks passed; retain unrelated local ledger and go.sum state. Existing Linux publication gates remain enabled; local checks do not claim a completed new release or deployment.
+
 ## 2026-11-17: Publish affiliate activity reward fulfillment
 
 The user authorizes GitHub submission of the completed activity-center changes and their required core support. Submit only affiliate fixed-code admin fulfillment, redeem-code length migration, balance-history display, related tests and these maintenance entries to the existing `dev` branch. The companion extra `main` includes probability changes, non-recharge reward credits and administrator threshold auditing. Preserve unrelated work and keep operator accounting in extra; no server access, deployment or production credit is authorized by this publication request.

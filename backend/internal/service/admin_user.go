@@ -699,8 +699,20 @@ func (s *adminServiceImpl) GetUserUsageStats(ctx context.Context, userID int64, 
 // GetUserBalanceHistory returns paginated balance/concurrency change records for a user.
 func (s *adminServiceImpl) GetUserBalanceHistory(ctx context.Context, userID int64, page, pageSize int, codeType string) ([]RedeemCode, int64, float64, error) {
 	params := pagination.PaginationParams{Page: page, PageSize: pageSize}
-	if codeType == "" || codeType == RedeemTypeAffiliateBalance {
-		return s.getAllUserBalanceHistory(ctx, userID, params, codeType)
+	if codeType == RedeemTypeAffiliateBalance {
+		codes, total, err := s.listAffiliateBalanceHistory(ctx, userID, params)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		totalRecharged, err := s.redeemCodeRepo.SumPositiveBalanceByUser(ctx, userID)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		return codes, total, totalRecharged, nil
+	}
+
+	if codeType == "" {
+		return s.getAllUserBalanceHistory(ctx, userID, params)
 	}
 
 	codes, result, err := s.redeemCodeRepo.ListByUserPaginated(ctx, userID, params, codeType)
@@ -716,13 +728,13 @@ func (s *adminServiceImpl) GetUserBalanceHistory(ctx context.Context, userID int
 	return codes, total, totalRecharged, nil
 }
 
-func (s *adminServiceImpl) getAllUserBalanceHistory(ctx context.Context, userID int64, params pagination.PaginationParams, codeType string) ([]RedeemCode, int64, float64, error) {
+func (s *adminServiceImpl) getAllUserBalanceHistory(ctx context.Context, userID int64, params pagination.PaginationParams) ([]RedeemCode, int64, float64, error) {
 	needed := params.Offset() + params.Limit()
 	if needed < params.Limit() {
 		needed = params.Limit()
 	}
 
-	redeemCodes, redeemTotal, err := s.listRedeemBalanceHistoryForMerge(ctx, userID, needed, codeType)
+	redeemCodes, redeemTotal, err := s.listRedeemBalanceHistoryForMerge(ctx, userID, needed)
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -739,7 +751,7 @@ func (s *adminServiceImpl) getAllUserBalanceHistory(ctx context.Context, userID 
 	return codes, redeemTotal + affiliateTotal, totalRecharged, nil
 }
 
-func (s *adminServiceImpl) listRedeemBalanceHistoryForMerge(ctx context.Context, userID int64, needed int, codeType string) ([]RedeemCode, int64, error) {
+func (s *adminServiceImpl) listRedeemBalanceHistoryForMerge(ctx context.Context, userID int64, needed int) ([]RedeemCode, int64, error) {
 	if needed <= 0 {
 		return nil, 0, nil
 	}
@@ -750,7 +762,7 @@ func (s *adminServiceImpl) listRedeemBalanceHistoryForMerge(ctx context.Context,
 	)
 	for page := 1; len(out) < needed; page++ {
 		params := pagination.PaginationParams{Page: page, PageSize: 1000}
-		codes, result, err := s.redeemCodeRepo.ListByUserPaginated(ctx, userID, params, codeType)
+		codes, result, err := s.redeemCodeRepo.ListByUserPaginated(ctx, userID, params, "")
 		if err != nil {
 			return nil, 0, err
 		}
