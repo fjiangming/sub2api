@@ -33,6 +33,6 @@ The operations center preserves encrypted source on processing errors (including
 
 Operator documentation: [operations-center conversation logs](https://github.com/fjiangming/sub2api-extra/blob/main/operations-center/docs/conversation-logs.md). The companion operations center is released from its main branch as `ghcr.io/fjiangming/sub2api-extra:operations-center-latest`; update it separately from the core application.
 
-Fresh dev is based on upstream main 530c5e3a. Previous dev billing recovery changes are intentionally not carried forward. The existing companion billing-recovery UI may report unavailable against the fresh native core; this archive does not restore those unrelated custom APIs.
+Dev includes upstream main 15871f904 (0.2.22), merged after the original refresh from 530c5e3a. Previous dev billing recovery changes are intentionally not carried forward. The existing companion billing-recovery UI may report unavailable against the native core; this archive does not restore those unrelated custom APIs.
 
 Every dev push triggers Fork Dev Release. Tested five-platform archives and checksums are published to this fork's GitHub Releases; native amd64/arm64 images are published to `ghcr.io/fjiangming/sub2api:<numeric-version>`. Only the highest completed numeric release advances GitHub latest and image aliases `dev` / `latest`. The updater and version menu point to this fork. Source publishing never updates a running server.

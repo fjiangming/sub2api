@@ -1,5 +1,15 @@
 # Fork Customizations
 
+## 2026-11-17: Merge upstream 0.2.22 into dev
+
+The user requests merging the already synchronized GitHub main into dev and verifying conflicts and functionality. Merge origin/main `15871f904056f548dd874a1d069ffc6cdf777b78` into dev `6e77f0f9f3ceac7416a39ce7e325244945c2f196`, preserving both parents. The upstream range from the previous common base `530c5e3a4f9c73ca2b0881191d0ef8e0d82c5484` contains 186 commits and advances the native version to 0.2.22. No server deployment or production mutation is included.
+
+All incoming source, configuration and test changes are recorded by that exact upstream range: gateway/model compatibility, account and scheduler handling, native billing batching and usage rollups, group Ultra Fast settings, generated Ent/Wire files, migrations, pricing, frontend account/group/usage views, build tooling and upstream regressions. Use upstream implementations without manual overrides. The shared `http_upstream.go`, `openai_ws_v2_passthrough_adapter.go` and `go.mod` merge automatically with zero Git conflicts. Preserve the collector wrappers together with upstream socket keepalive and session-aware WebSocket identity changes. The existing Go 1.27.4 patch is now also native upstream.
+
+Keep conversation capture, user/model exclusions, fork update sources and the custom release workflow. Do not restore the reverted activity-specific core fulfillment changes or old billing-recovery APIs. `CONVERSATION_LOGS.md` now identifies the merged upstream base. Preserve the two unrelated local maintenance additions and existing go.sum state; only this section is included in the merge commit's ledger. Existing local files were backed up before merging.
+
+Local verification: all 386 frontend files / 3,143 tests, lint, locale validation, vue-tsc and the Vite production build passed. Full backend `go vet -tags=unit ./...`, embedded-web tests and Linux amd64 compilation with the built frontend passed. The full native Go unit attempt encounters the unchanged cgroup symlink test's Windows privilege requirement; do not claim that command passed. The collector, handler, repository, server and middleware packages passed. Local Docker is unavailable and Windows has no C compiler, so final Linux unit / integration / socket / race / lint / security and release validation remains in the existing GitHub workflows. Scoped whitespace and unresolved-index checks passed; source publication does not deploy the server.
+
 ## 2026-11-17: Restore the original core reward contract
 
 The user confirms an activity-center-only implementation and explicitly requests undoing unnecessary core changes. Reverse only the 15 source / test / migration files introduced or modified by `6c46e2526`: restore the original redeem handler / service / balance-history merge, Ent schema and generated column width, user / administrator RedeemView types and rendering, and the affected existing tests; remove the two added affiliate fulfillment / history tests, the repository fixture and migration 251. Preserve unrelated local maintenance entries and go.sum state. Keep the previous entries as history.
