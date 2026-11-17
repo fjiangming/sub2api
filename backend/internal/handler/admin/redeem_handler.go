@@ -47,7 +47,7 @@ type GenerateRedeemCodesRequest struct {
 // Type 为 omitempty 而非 required 是为了向后兼容旧版调用方（不传 type 时默认 balance）。
 type CreateAndRedeemCodeRequest struct {
 	Code          string     `json:"code" binding:"required,min=3,max=128"`
-	Type          string     `json:"type" binding:"omitempty,oneof=balance concurrency subscription invitation"` // 不传时默认 balance（向后兼容）
+	Type          string     `json:"type" binding:"omitempty,oneof=balance affiliate_balance concurrency subscription invitation"` // 不传时默认 balance（向后兼容）
 	Value         float64    `json:"value" binding:"required"`
 	UserID        int64      `json:"user_id" binding:"required,gt=0"`
 	GroupID       *int64     `json:"group_id"`      // subscription 类型必填
@@ -181,6 +181,10 @@ func (h *RedeemHandler) CreateAndRedeem(c *gin.Context) {
 	// 请勿删除此默认值逻辑，否则会导致旧版调用方 400 报错。
 	if req.Type == "" {
 		req.Type = "balance"
+	}
+	if req.Type == service.RedeemTypeAffiliateBalance && req.Value <= 0 {
+		response.BadRequest(c, "affiliate_balance value must be positive")
+		return
 	}
 
 	if req.Type == "subscription" {

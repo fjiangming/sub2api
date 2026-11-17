@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -37,6 +38,7 @@ const (
 )
 
 type ctxKeySkipRedeemAffiliate struct{}
+type ctxKeyAdminRedeemFulfillment struct{}
 
 // ContextSkipRedeemAffiliate returns a context that suppresses the redeem-level
 // affiliate rebate. Used by payment fulfillment which handles rebate separately
@@ -260,6 +262,9 @@ func (s *RedeemService) CreateCode(ctx context.Context, code *RedeemCode) error 
 	if code.Type == "" {
 		code.Type = RedeemTypeBalance
 	}
+	if code.Type == RedeemTypeAffiliateBalance && (code.Value <= 0 || math.IsNaN(code.Value) || math.IsInf(code.Value, 0)) {
+		return infraerrors.BadRequest("REDEEM_CODE_INVALID", "affiliate_balance value must be finite and positive")
+	}
 	if code.Type != RedeemTypeInvitation && code.Value == 0 {
 		return errors.New("value must not be zero")
 	}
@@ -406,9 +411,10 @@ func (s *RedeemService) redeemForPaymentFulfillment(ctx context.Context, userID 
 // RedeemForAdminFulfillment is restricted to trusted admin fulfillment.
 // Admin retries must not be blocked by, or contribute to, a user's public
 // redeem failure counter. Unlike payment fulfillment, the normal redeem-level
-// affiliate rebate remains enabled.
+// affiliate rebate remains enabled for normal balance codes. Non-recharge
+// affiliate_balance credits are available only through this admin path.
 func (s *RedeemService) RedeemForAdminFulfillment(ctx context.Context, userID int64, code string) (*RedeemCode, error) {
-	return s.redeem(ctx, userID, code, bypassRedeemRateLimit)
+	return s.redeem(context.WithValue(ctx, ctxKeyAdminRedeemFulfillment{}, true), userID, code, bypassRedeemRateLimit)
 }
 
 func (s *RedeemService) redeem(ctx context.Context, userID int64, code string, rateLimitPolicy redeemRateLimitPolicy) (*RedeemCode, error) {
@@ -453,6 +459,13 @@ func (s *RedeemService) redeem(ctx context.Context, userID int64, code string, r
 	// 验证兑换码类型的前置条件。邀请码属于注册流程，不能通过普通兑换接口使用。
 	switch redeemCode.Type {
 	case RedeemTypeBalance, RedeemTypeConcurrency:
+	case RedeemTypeAffiliateBalance:
+		if ctx.Value(ctxKeyAdminRedeemFulfillment{}) != true {
+			return nil, unsupportedRedeemTypeError(redeemCode.Type)
+		}
+		if redeemCode.Value <= 0 || math.IsNaN(redeemCode.Value) || math.IsInf(redeemCode.Value, 0) {
+			return nil, infraerrors.BadRequest("REDEEM_CODE_INVALID", "affiliate_balance value must be finite and positive")
+		}
 	case RedeemTypeSubscription:
 		if redeemCode.GroupID == nil {
 			return nil, infraerrors.BadRequest("REDEEM_CODE_INVALID", "invalid subscription redeem code: missing group_id")
@@ -488,7 +501,7 @@ func (s *RedeemService) redeem(ctx context.Context, userID int64, code string, r
 
 	// 执行兑换逻辑（兑换码已被锁定，此时可安全操作）
 	switch redeemCode.Type {
-	case RedeemTypeBalance:
+	case RedeemTypeBalance, RedeemTypeAffiliateBalance:
 		amount := redeemCode.Value
 		if amount < 0 {
 			if s.redeemUserRepo == nil {
@@ -566,7 +579,7 @@ func (s *RedeemService) redeem(ctx context.Context, userID int64, code string, r
 // invalidateRedeemCaches 失效兑换相关的缓存
 func (s *RedeemService) invalidateRedeemCaches(ctx context.Context, userID int64, redeemCode *RedeemCode) {
 	switch redeemCode.Type {
-	case RedeemTypeBalance:
+	case RedeemTypeBalance, RedeemTypeAffiliateBalance:
 		if s.authCacheInvalidator != nil {
 			s.authCacheInvalidator.InvalidateAuthCacheByUserID(ctx, userID)
 		}

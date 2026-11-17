@@ -184,4 +184,27 @@ describe('admin RedeemView batch update', () => {
     })
     expect(showSuccess).toHaveBeenCalledWith('admin.redeem.batchUpdateSuccess')
   })
+
+  it('labels and filters activity reward receipts as rebate transfers', async () => {
+    listRedeemCodes.mockResolvedValue({ items: [{
+      id: 42, code: 'AC-REWARD', type: 'affiliate_balance', value: 0.5,
+      status: 'used', used_by: 42, used_at: '2026-11-17T00:00:00Z', created_at: '2026-11-17T00:00:00Z',
+    }], total: 1, page: 1, page_size: 20, pages: 1 })
+    const wrapper = mount(RedeemView, {
+      global: { stubs: {
+        AppLayout: { template: '<div><slot /></div>' },
+        TablePageLayout: { template: '<div><slot name="filters" /><slot name="table" /><slot name="pagination" /></div>' },
+        DataTable: DataTableStub, Pagination: true, ConfirmDialog: true, Select: SelectStub,
+        GroupBadge: true, GroupOptionItem: true, Icon: true, Teleport: true,
+      } },
+    })
+    await flushPromises()
+    expect(wrapper.get('table').text()).toContain('admin.users.typeAffiliateBalance')
+    expect(wrapper.get('table').text()).toContain('$0.50')
+    const typeFilter = wrapper.findAll('select').find(select => select.find('option[value="affiliate_balance"]').exists())!
+    await typeFilter.setValue('affiliate_balance')
+    await flushPromises()
+    expect(listRedeemCodes).toHaveBeenLastCalledWith(1, 20, expect.objectContaining({ type: 'affiliate_balance' }), expect.anything())
+    wrapper.unmount()
+  })
 })

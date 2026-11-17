@@ -36,7 +36,7 @@ func (RedeemCode) Annotations() []schema.Annotation {
 func (RedeemCode) Fields() []ent.Field {
 	return []ent.Field{
 		field.String("code").
-			MaxLen(32).
+			MaxLen(128).
 			NotEmpty().
 			Unique(),
 		field.String("type").
