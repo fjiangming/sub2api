@@ -48,6 +48,7 @@ jobs:
         run: |
           go test -tags=unit ./...
           go test -race ./internal/pkg/conversationlog
+          go test -tags=unit -race ./internal/repository -run '^TestHTTPUpstreamConversationTailLifecycle$' -count=1
       - name: Check reachable vulnerabilities before publication
         working-directory: backend
         run: |

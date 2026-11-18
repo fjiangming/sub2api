@@ -14,6 +14,15 @@ type upstreamDrainPolicy struct {
 	timeout time.Duration
 }
 
+// UpstreamClientContext exposes the existing cancellation source for admission
+// checks without changing the native billing drain or request deadline.
+func UpstreamClientContext(ctx context.Context) context.Context {
+	if policy, ok := ctx.Value(upstreamDrainKey{}).(upstreamDrainPolicy); ok {
+		return policy.client
+	}
+	return ctx
+}
+
 // DetachUpstreamContext keeps billing reads alive after the client leaves. It
 // records the original cancellation signal without starting a timer or changing
 // existing construction-time release semantics. The transport owns the actual

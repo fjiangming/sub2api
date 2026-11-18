@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/conversationlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
@@ -340,7 +342,8 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 	if clientStream {
 		upstreamCtx, cancelUpstream = context.WithCancel(upstreamCtx)
 	}
-	defer cancelUpstream()
+	var upstreamResponseBody io.ReadCloser
+	defer func() { _ = conversationlog.CloseResponse(upstreamResponseBody, cancelUpstream) }()
 	upstreamReq, err := s.buildUpstreamRequest(upstreamCtx, c, account, responsesBody, token, true, promptCacheKey, false)
 	releaseUpstreamCtx()
 	if err != nil {
@@ -365,10 +368,7 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 	if err != nil {
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 	}
-	defer func() {
-		cancelUpstream()
-		_ = resp.Body.Close()
-	}()
+	upstreamResponseBody = resp.Body
 
 	// 8. Handle error response with failover
 	if resp.StatusCode >= 400 {
@@ -925,6 +925,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 
 		isTerminalEvent := isOpenAICompatResponsesTerminalEvent(event.Type)
 		if isTerminalEvent {
+			conversationlog.MarkResponseTerminal(resp)
 			terminalEventType = strings.TrimSpace(event.Type)
 			if event.Usage != nil {
 				usage = copyOpenAIUsageFromResponsesUsage(event.Usage)

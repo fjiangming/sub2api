@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/conversationlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
 )
@@ -339,8 +340,11 @@ type openAIRequestContextReadCloser struct {
 
 func (r *openAIRequestContextReadCloser) Close() error {
 	r.once.Do(func() {
-		r.cleanup()
-		r.err = r.ReadCloser.Close()
+		r.err = conversationlog.CloseResponse(r.ReadCloser, r.cleanup)
 	})
 	return r.err
+}
+
+func (r *openAIRequestContextReadCloser) ConversationTail() *conversationlog.ResponseTail {
+	return conversationlog.ResponseTailOf(r.ReadCloser)
 }

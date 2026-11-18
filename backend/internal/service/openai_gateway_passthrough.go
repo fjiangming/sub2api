@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/conversationlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
@@ -2278,6 +2279,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		// Codex bare error 序列（error 后可能跟 response.failed 或翻盘的 completed）
 		// 必须继续读取，不适用提前结束。
 		if (sawDone || sawTerminalEvent) && line == "" && (!codexFailureTerminal || !sawBareError) {
+			conversationlog.MarkResponseTerminal(resp)
 			break
 		}
 	}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/conversationlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
@@ -929,6 +930,7 @@ func (s *OpenAIGatewayService) readOpenAICompatBufferedTerminal(
 						acc.ProcessEvent(&event)
 						recordPrior(&event)
 						if response := openAICompatTerminalResponse(&event, []byte(payload)); isOpenAICompatResponsesTerminalEvent(event.Type) && response != nil {
+							conversationlog.MarkResponseTerminal(resp)
 							if event.Usage != nil {
 								usage = copyOpenAIUsageFromResponsesUsage(event.Usage)
 								if response.Usage == nil {
@@ -956,6 +958,7 @@ func (s *OpenAIGatewayService) readOpenAICompatBufferedTerminal(
 			}
 
 			if isOpenAICompatDoneSentinelLine(ev.line) {
+				conversationlog.MarkResponseTerminal(resp)
 				return nil, usage, acc, prior, nil
 			}
 			frame, ok := parser.AddLine(ev.line)
@@ -979,6 +982,7 @@ func (s *OpenAIGatewayService) readOpenAICompatBufferedTerminal(
 			recordPrior(&event)
 
 			if response := openAICompatTerminalResponse(&event, []byte(payload)); isOpenAICompatResponsesTerminalEvent(event.Type) && response != nil {
+				conversationlog.MarkResponseTerminal(resp)
 				if event.Usage != nil {
 					usage = copyOpenAIUsageFromResponsesUsage(event.Usage)
 					if response.Usage == nil {
@@ -1133,6 +1137,9 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 		eventType := strings.TrimSpace(event.Type)
 		isBareErrorEvent := eventType == "error"
 		isTerminalEvent := isOpenAICompatResponsesTerminalEvent(eventType) || isBareErrorEvent
+		if isTerminalEvent {
+			conversationlog.MarkResponseTerminal(resp)
+		}
 		if isTerminalEvent {
 			terminalEventType = eventType
 			if event.Response != nil {
@@ -1310,6 +1317,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 		for scanner.Scan() {
 			line := scanner.Text()
 			if isOpenAICompatDoneSentinelLine(line) {
+				conversationlog.MarkResponseTerminal(resp)
 				return missingTerminalErr()
 			}
 			frame, ok := parser.AddLine(line)
@@ -1410,6 +1418,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 			lastDataAt = time.Now()
 			line := ev.line
 			if isOpenAICompatDoneSentinelLine(line) {
+				conversationlog.MarkResponseTerminal(resp)
 				return missingTerminalErr()
 			}
 			frame, ok := parser.AddLine(line)

@@ -135,6 +135,8 @@ type upstreamClientEntry struct {
 	protocolMode string       // 协议模式（default/long_stream_h2/openai_h1/openai_h2/openai_h1_fallback）
 	lastUsed     int64        // 最后使用时间戳（纳秒），用于 LRU 淘汰
 	inFlight     int64        // 当前进行中的请求数，>0 时不可淘汰
+	tailEpoch    atomic.Uint64
+	activeTail   atomic.Pointer[conversationlog.ResponseTail]
 }
 
 type openAIHTTP2FallbackState struct {
@@ -215,6 +217,7 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 	if err != nil {
 		return nil, err
 	}
+	tailEpoch := entry.yieldConversationTail()
 
 	// 执行请求
 	client := s.httpClientForUpstreamRequest(entry.client, req)
@@ -232,7 +235,9 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 
 	// 包装响应体，在关闭时自动减少计数并更新时间戳
 	// 这确保了流式响应（如 SSE）在完全读取前不会被淘汰
+	tail := entry.trackConversationTail(resp.Body, tailEpoch)
 	resp.Body = wrapTrackedBody(resp.Body, func() {
+		entry.activeTail.CompareAndSwap(tail, nil)
 		atomic.AddInt64(&entry.inFlight, -1)
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
 	})
@@ -278,6 +283,7 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 		slog.Debug("tls_fingerprint_acquire_client_failed", "account_id", accountID, "error", err)
 		return nil, err
 	}
+	tailEpoch := entry.yieldConversationTail()
 
 	client := s.httpClientForUpstreamRequest(entry.client, req)
 	client = httpClientWithGrokAccessDeniedFallback(client)
@@ -290,7 +296,9 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 		return nil, err
 	}
 
+	tail := entry.trackConversationTail(resp.Body, tailEpoch)
 	resp.Body = wrapTrackedBody(resp.Body, func() {
+		entry.activeTail.CompareAndSwap(tail, nil)
 		atomic.AddInt64(&entry.inFlight, -1)
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
 	})
@@ -318,8 +326,13 @@ func doUpstreamRequest(client *http.Client, req *http.Request, drainTimeouts ...
 		cancel()
 		return resp, err
 	}
+	var tail *conversationlog.ResponseTail
+	// Zstd's asynchronous prefetch is not serialized by the foreground readMu.
+	if !strings.EqualFold(strings.TrimSpace(resp.Header.Get("Content-Encoding")), "zstd") {
+		tail = conversationlog.NewResponseTail(resp.Body, ctx, pkghttputil.UpstreamClientContext(req.Context()))
+	}
 	decompressResponseBody(resp)
-	resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
+	resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel, tail: tail}
 	return resp, nil
 }
 
@@ -330,12 +343,16 @@ type cancelOnCloseBody struct {
 	err    error
 	readMu sync.Mutex
 	closed bool
+	tail   *conversationlog.ResponseTail
 }
 
 func (b *cancelOnCloseBody) Read(p []byte) (int, error) {
+	if b.tail != nil && b.tail.Closing() {
+		return 0, http.ErrBodyReadAfterClose
+	}
 	b.readMu.Lock()
 	defer b.readMu.Unlock()
-	if b.closed {
+	if b.closed || b.tail != nil && b.tail.Closing() {
 		return 0, http.ErrBodyReadAfterClose
 	}
 	return b.ReadCloser.Read(p)
@@ -343,6 +360,16 @@ func (b *cancelOnCloseBody) Read(p []byte) (int, error) {
 
 func (b *cancelOnCloseBody) Close() error {
 	b.once.Do(func() {
+		if b.tail != nil && b.tail.Start(b.cancel, func() func() {
+			b.readMu.Lock()
+			b.closed = true
+			return b.readMu.Unlock
+		}, func() {
+			b.cancel()
+			_ = b.ReadCloser.Close()
+		}) {
+			return
+		}
 		// Cancel before closing, including before closing a decompressor. In Go
 		// 1.27 an early HTTP/1 close concurrent with Read can otherwise leave an
 		// EOF waiter on a reused connection and stall subsequent responses.
@@ -1523,7 +1550,7 @@ type trackedBody struct {
 func (b *trackedBody) Close() error {
 	err := b.ReadCloser.Close()
 	if b.onClose != nil {
-		b.once.Do(b.onClose)
+		b.once.Do(func() { conversationlog.AfterResponseClose(b.ReadCloser, b.onClose) })
 	}
 	return err
 }

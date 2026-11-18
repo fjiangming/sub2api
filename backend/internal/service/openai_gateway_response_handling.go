@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/conversationlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
@@ -875,6 +876,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			// Codex bare error 序列（error 后可能跟 response.failed 或翻盘的 completed）
 			// 必须继续读取，不适用提前结束。
 			if sawTerminalEvent && !eventInProgress && (!codexFailureTerminal || !sawBareError) {
+				conversationlog.MarkResponseTerminal(resp)
 				return finalizeStream()
 			}
 		}
@@ -970,6 +972,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			// Codex bare error 序列（error 后可能跟 response.failed 或翻盘的 completed）
 			// 必须继续读取，不适用提前结束。
 			if sawTerminalEvent && !eventInProgress && (!codexFailureTerminal || !sawBareError) {
+				conversationlog.MarkResponseTerminal(resp)
 				_ = resp.Body.Close()
 				return finalizeStream()
 			}

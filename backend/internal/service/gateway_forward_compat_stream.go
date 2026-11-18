@@ -13,6 +13,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/conversationlog"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -158,6 +159,9 @@ func (st *anthropicCompatStream) observe(event *apicompat.AnthropicStreamEvent, 
 		st.upstreamErrPayload = payload
 		st.upstreamErrType = firstNonEmpty(gjson.Get(payload, "error.type").String(), "upstream_error")
 		st.upstreamErrMessage = firstNonEmpty(sanitizeUpstreamErrorMessage(gjson.Get(payload, "error.message").String()), "upstream stream error")
+		if body, ok := st.body.(io.ReadCloser); ok {
+			conversationlog.MarkResponseTerminal(&http.Response{Body: body})
+		}
 		_ = st.body.Close()
 		logger.L().Warn(st.logPrefix+" stream: upstream error event",
 			zap.String("request_id", st.requestID),
