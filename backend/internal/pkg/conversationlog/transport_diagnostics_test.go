@@ -177,7 +177,10 @@ func TestTransportDiagnosticsNegotiateBeforeFirstSendAndKeepRetriesStable(t *tes
 		for _, change := range []bool{false, true} {
 			t.Run(fmt.Sprintf("initial%d/change%v", initial, change), func(t *testing.T) {
 				c, p, mu := fixture(t, policy{Version: 1, Enabled: true, TransportDiagnosticsVersion: initial})
-				s := bind(context.Background(), c, 1, 2, "").Value(scopeKey).(*scope)
+				s, ok := bind(context.Background(), c, 1, 2, "").Value(scopeKey).(*scope)
+				if !ok {
+					t.Fatal("collector scope was not bound")
+				}
 				a := s.begin(3, "upstream.example", "/responses", "POST", "JSON")
 				a.append("request", []byte(`{"model":"test"}`), io.EOF)
 				a.append("response", []byte("unchanged"), io.EOF)

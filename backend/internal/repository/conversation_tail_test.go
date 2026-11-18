@@ -101,7 +101,7 @@ func requireFollowingResponse(t *testing.T, srv *httptest.Server, do func(*http.
 	require.NoError(t, err)
 	resp, err := do(req)
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { require.NoError(t, resp.Body.Close()) }()
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.Equal(t, "following response", string(body), "old read must never consume the next response")
@@ -111,7 +111,9 @@ func TestHTTPUpstreamConversationTailLifecycle(t *testing.T) {
 	// Bind initializes a process-global collector. A child keeps repeated runs
 	// independent and leaves other repository tests' environment untouched.
 	if os.Getenv("SUB2API_TAIL_TEST_CHILD") != "1" {
-		cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestHTTPUpstreamConversationTailLifecycle$", "-test.timeout=60s")
+		executable, err := os.Executable()
+		require.NoError(t, err)
+		cmd := exec.CommandContext(t.Context(), executable, "-test.run=^TestHTTPUpstreamConversationTailLifecycle$", "-test.timeout=60s")
 		cmd.Env = append(os.Environ(), "SUB2API_TAIL_TEST_CHILD=1")
 		output, err := cmd.CombinedOutput()
 		require.NoError(t, err, "%s", output)
@@ -233,7 +235,10 @@ func runHTTPUpstreamConversationTailLifecycle(t *testing.T) {
 				if sample.terminal {
 					conversationlog.MarkResponseTerminal(resp)
 					started := make(chan struct{})
-					body := resp.Body.(*trackedBody).ReadCloser.(*cancelOnCloseBody)
+					tracked, ok := resp.Body.(*trackedBody)
+					require.True(t, ok, "response must use the native tracked body")
+					body, ok := tracked.ReadCloser.(*cancelOnCloseBody)
+					require.True(t, ok, "response must use the native cancel-on-close body")
 					body.ReadCloser = &notifyReadCloser{ReadCloser: body.ReadCloser, started: started}
 					readDone = make(chan error, 1)
 					go func() { _, err := resp.Body.Read(make([]byte, 1)); readDone <- err }()
